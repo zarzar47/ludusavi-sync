@@ -1,180 +1,71 @@
-# ![Logo](assets/icon.svg) Ludusavi
-Ludusavi is a tool for backing up your PC video game save data,
-written in [Rust](https://www.rust-lang.org).
-It is cross-platform and supports multiple game stores.
+# Ludusavi Sync
+
+Per-game cloud save sync for your PC and Steam Deck, built on the
+[ludusavi](https://github.com/mtkennerly/ludusavi) backup engine.
+
+Ludusavi Sync keeps individual games in sync across devices through a shared
+cloud folder (Google Drive via [rclone](https://rclone.org/)), instead of
+mirroring your entire backup. Underneath, it keeps ludusavi's full backup and
+restore engine intact, so it still understands 19,000+ games, Windows registry
+saves, Steam screenshots, and Proton/Wine prefixes.
 
 ## Features
-* Ability to back up data from more than 19,000 games plus your own custom entries.
-* Backup and restore for Steam, GOG, Epic, Heroic, Lutris, and other game libraries.
-* Both a graphical interface and command line interface for scripting.
-  Tab completion is available for Bash, Fish, Zsh, PowerShell, and Elvish.
-* Support for:
-  * Saves that are stored as files and in the Windows registry.
-  * Proton saves with Steam.
-  * Steam screenshots.
-* Available as a [Playnite](https://playnite.link) extension:
-  https://github.com/mtkennerly/ludusavi-playnite
-* Works on the Steam Deck.
 
-This tool uses the [Ludusavi Manifest](https://github.com/mtkennerly/ludusavi-manifest)
-for info on what to back up for each game.
-The data is primarily sourced from [PCGamingWiki](https://www.pcgamingwiki.com/wiki/Home),
-so please contribute any new or fixed data back to the wiki itself,
-and your improvements will be incorporated into Ludusavi's data as well.
-
-If you'd like to help translate Ludusavi into other languages,
-[check out the Crowdin project](https://crowdin.com/project/ludusavi).
-
-## Demo
-<!-- These anchors are kept for compatibility with old section headers. -->
-<a name="gui"></a>
-
-> ![GUI demo of previewing a backup](docs/demo-gui.gif)
-
-## Fork: Ludusavi Sync
-
-This repository is a fork of [ludusavi](https://github.com/mtkennerly/ludusavi)
-with per-game cloud sync added on top of the existing backup tool.
-The base tool's features (19,000+ game saves, multi-store support, CLI + GUI)
-are fully intact. The fork adds:
-
-* **Per-game cloud sync** -- push and pull individual games to a shared cloud folder
-  (Google Drive via rclone), rather than mirroring your entire backup.
-* **Additive-only transfers** -- `rclone copy` is used instead of `rclone sync`,
-  so pushing one game can never delete another game's cloud data.
-* **Cross-device Wine/Proton remap** -- backed-up Proton saves resolve to the
-  correct local prefix on each machine, even when the Linux username and
+* **Per-game cloud sync** -- push or pull one game at a time to a shared cloud folder.
+* **Additive-only transfers** -- sync uses `rclone copy`, so syncing one game can
+  never delete another game's cloud data.
+* **Cross-device Wine/Proton remap** -- Proton saves backed up on one machine resolve
+  to the correct local prefix on another, even when the Linux username and
   compatdata app ID differ between devices.
-* **Tauri desktop GUI** -- a lightweight React+TypeScript frontend (in `desktop/`)
-  with a star-to-sync game list, search, scan, backup/pull/push controls, and
-  cloud settings.
-* **CLI subcommand** -- `ludusavi sync push|pull|status` for scripting and
-  headless use (e.g. Steam Deck via SSH or a cron job).
+* **Tauri desktop app** -- a lightweight React + TypeScript GUI in `desktop/` with a
+  star-to-sync game list, search, library scan, per-game backup/push/pull controls
+  with live progress, and cloud settings.
+* **CLI** -- `ludusavi sync push|pull|status` for scripting and headless use
+  (SSH into your Deck, cron jobs, etc.).
+* **Full backup engine** -- file and registry saves, multi-store support
+  (Steam, GOG, Epic, Heroic, Lutris, ...), custom games, backup validation,
+  retention, and more.
 
-Upstream documentation for the base tool's features and configuration is
-preserved below and in the `docs/` directory.
+## How it works
 
-## Installation
-<!-- These anchors are kept for compatibility with old section headers. -->
-<a name="requirements"></a>
-<a name="methods"></a>
+Each game's local backup lives under your backup root (configured in
+`config.yaml`). `sync push` uploads a game's backup folder to your cloud folder;
+`sync pull` downloads it back. Per-game metadata (last push, source device, and the
+Wine prefix mapping) is recorded in `settings.config` at the backup root and merged
+across devices, so every machine can restore a game into its own local prefix.
 
-Download the executable for Windows, Linux, or Mac from the
-[releases page](https://github.com/mtkennerly/ludusavi/releases).
-It's portable, so you can simply download it and put it anywhere on your system.
+## Getting started
 
-If you prefer, Ludusavi is also available via
-[Winget, Scoop, Flatpak, and Cargo](docs/help/installation.md).
+### Desktop app
 
-Note:
+1. Build and launch the app (see [Building](#building)).
+2. Open **Settings** (gear icon) and connect Google Drive; set the cloud folder.
+3. Star the games you want to keep in sync. Hit **Scan** to discover installed
+   games, then use **Backup** / **Push** / **Pull** per game.
 
-* Windows users may see a popup that says
-  "Windows protected your PC",
-  because Windows does not recognize the program's publisher.
-  Click "more info" and then "run anyway" to start the program.
-* Mac users may see a popup that says
-  "Ludusavi can't be opened because it is from an unidentified developer".
-  To allow Ludusavi to run, please refer to [this article](https://support.apple.com/en-us/102445),
-  specifically the section on `If you want to open an app [...] from an unidentified developer`.
+### CLI
 
-## Usage
-<!-- These anchors are kept for compatibility with old section headers. -->
-<a name="backup-exclusions"></a>
-<a name="backup-retention"></a>
-<a name="backup-structure"></a>
-<a name="backup-validation"></a>
-<a name="cli-api"></a>
-<a name="cloud-backup"></a>
-<a name="command-line"></a>
-<a name="configuration"></a>
-<a name="configuration-file"></a>
-<a name="custom-games"></a>
-<a name="duplicates"></a>
-<a name="environment-variables"></a>
-<a name="filter"></a>
-<a name="game-launch-wrapping"></a>
-<a name="logging"></a>
-<a name="redirects"></a>
-<a name="roots"></a>
-<a name="selective-scanning"></a>
-<a name="troubleshooting"></a>
+```bash
+# One-time setup
+ludusavi manifest update
+ludusavi cloud set google-drive        # or: cloud set custom --id <rclone remote>
+# set the cloud folder in config.yaml under `cloud.path`
 
-Detailed help documentation is available for several topics.
+# Back up a game locally, then sync it
+ludusavi backup "Baldur's Gate 3"
+ludusavi sync push "Baldur's Gate 3"
+ludusavi sync pull "Baldur's Gate 3"
+ludusavi sync status "Baldur's Gate 3"
+```
 
-### General
-* [Backup automation](/docs/help/backup-automation.md)
-* [Backup exclusions](/docs/help/backup-exclusions.md)
-* [Backup retention](/docs/help/backup-retention.md)
-* [Backup validation](/docs/help/backup-validation.md)
-* [Cloud backup](/docs/help/cloud-backup.md)
-* [Custom games](/docs/help/custom-games.md)
-* [Duplicates](/docs/help/duplicates.md)
-* [Filter](/docs/help/filter.md)
-* [Game launch wrapping](/docs/help/game-launch-wrapping.md)
-* [Redirects](/docs/help/redirects.md)
-* [Roots](/docs/help/roots.md)
-* [Selective scanning](/docs/help/selective-scanning.md)
-* [Transfer between operating systems](/docs/help/transfer-between-operating-systems.md)
+> `cloud upload` and `cloud download` mirror the whole backup directory with
+> `rclone sync` and can delete remote data. Prefer per-game
+> `sync push` / `sync pull`, which are additive and safe to mix across devices.
 
-### Interfaces
-* [Application folder](/docs/help/application-folder.md)
-* [Backup structure](/docs/help/backup-structure.md)
-* [Command line](/docs/help/command-line.md)
-* [Configuration file](/docs/help/configuration-file.md)
-* [Environment variables](/docs/help/environment-variables.md)
-* [Logging](/docs/help/logging.md)
+## Requirements
 
-### Other
-* [Troubleshooting](/docs/help/troubleshooting.md)
-* [What if my saves aren't found?](/docs/help/missing-saves.md)
-
-## Community
-
-The community has created some additional resources you may find useful.
-Please note that this is not an exhaustive list
-and that these projects are not officially affiliated with Ludusavi itself:
-
-* Secondary manifests:
-  * https://github.com/BloodShed-Oni/ludusavi-extra-manifests
-  * https://github.com/hblamo/ludusavi-emudeck-manifest
-  * https://github.com/hvmzx/ludusavi-manifests
-    * This has an example of using a scheduled GitHub workflow
-      to generate a manifest that adds more paths to the primary manifest's entries.
-* Plugins for other applications:
-  * Decky Loader on Steam Deck: https://github.com/GedasFX/decky-ludusavi
-  * LaunchBox: https://github.com/johagan94/ludusavi-launchbox
-  * VS Code: https://marketplace.visualstudio.com/items?itemName=claui.ludusavi
-* Tools:
-  * https://github.com/jose-l-martins/GSM-to-Ludusavi-converter
-
-## Comparison with other tools
-There are other excellent backup tools available, but not a singular
-cross-platform and cross-store solution:
-
-* [GameSave Manager](https://www.gamesave-manager.com) (as of v3.1.512.0):
-  * Only supports Windows.
-  * Much slower than Ludusavi. On the same hardware and with default settings,
-    an initial scan of the whole system takes 2 minutes in GSM versus 10 seconds in Ludusavi.
-    Performing a backup immediately after that scan takes 4 minutes 16 seconds in GSM versus 4.5 seconds in Ludusavi.
-    In this test, GSM found 257 games with 2.84 GB, and Ludusavi found 297 games with 2.95 GiB.
-  * Closed source, so the community cannot contribute improvements.
-  * Interface can be slow or unresponsive.
-    For example, when clicking "select all / de-select all", each checkbox has to individually toggle itself.
-    With 257 games, this means you end up having to wait around 42 seconds.
-  * Minimal command line interface.
-  * Can create symlinks for games and game data.
-    Ludusavi does not support this.
-* [Game Backup Monitor](https://mikemaximus.github.io/gbm-web) (as of v1.2.2):
-  * Does not support Mac.
-  * Database only covers 577 games (as of 2022-11-16), although it can also import
-    the Ludusavi manifest starting in 1.3.1.
-  * No command line interface.
-  * Can automatically back up saves for a game after you play it.
-    Ludusavi can only do that in conjunction with a launcher like Playnite.
-* [Gaming Backup Multitool for Linux](https://supremesonicbrazil.gitlab.io/gbml-web) (as of v1.4.0.0):
-  * Only supports Linux and Steam.
-  * Database is not actively updated. As of 2022-11-16, the last update was 2018-06-05.
-  * No command line interface.
+* [rclone](https://rclone.org/) -- required for any cloud operation.
+* Latest stable Rust, and on Linux the system packages listed under [Building](#building).
 
 ## Building
 
@@ -229,5 +120,13 @@ rustup target add x86_64-unknown-linux-musl
 cargo build --release --target x86_64-unknown-linux-musl
 ```
 
+## Documentation
+
+Detailed help for the underlying backup tool (configuration file, roots,
+redirects, custom games, backup exclusions/retention, troubleshooting, etc.)
+is under [docs/help/](./docs/help/), inherited from upstream
+[ludusavi](https://github.com/mtkennerly/ludusavi).
+
 ## Development
+
 Please refer to [CONTRIBUTING.md](./CONTRIBUTING.md).
