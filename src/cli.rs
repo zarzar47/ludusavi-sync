@@ -1165,7 +1165,8 @@ pub fn run(sub: Subcommand, no_manifest_update: bool, try_manifest_update: bool)
                     return Ok(());
                 }
 
-                let result = crate::sync::push_game(&config, &config.backup.path, &config.cloud.path, &game, finality, None)?;
+                let result =
+                    crate::sync::push_game(&config, &config.backup.path, &config.cloud.path, &game, finality, None)?;
                 report_cloud_changes(&result.changes, api);
             }
             parse::SyncSubcommand::Pull {
@@ -1188,7 +1189,8 @@ pub fn run(sub: Subcommand, no_manifest_update: bool, try_manifest_update: bool)
                     return Ok(());
                 }
 
-                let result = crate::sync::pull_game(&config, &config.backup.path, &config.cloud.path, &game, finality, None)?;
+                let result =
+                    crate::sync::pull_game(&config, &config.backup.path, &config.cloud.path, &game, finality, None)?;
                 report_cloud_changes(&result.changes, api);
             }
             parse::SyncSubcommand::Status { game, api } => {

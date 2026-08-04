@@ -1,7 +1,10 @@
 use std::{
     num::NonZeroUsize,
     path::PathBuf,
-    sync::{Arc, LazyLock, Mutex, atomic::{AtomicBool, Ordering}},
+    sync::{
+        Arc, LazyLock, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use itertools::Itertools;
