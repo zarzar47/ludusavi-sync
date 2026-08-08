@@ -46,6 +46,11 @@ jobs:
         with:
           env-var: LUDUSAVI_VERSION
           args: --style semver
+        env:
+          # dunamai-action plain `pip install`s itself, which Arch's pip refuses
+          # by default (PEP 668 externally-managed-environment). This is the
+          # standard override, not a real risk here - it's a throwaway CI container.
+          PIP_BREAK_SYSTEM_PACKAGES: "1"
 
       - name: Inject version into tauri.conf.json
         run: |
