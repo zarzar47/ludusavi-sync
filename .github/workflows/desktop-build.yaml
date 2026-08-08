@@ -16,6 +16,19 @@ jobs:
     runs-on: ubuntu-latest
     container: archlinux:latest
     steps:
+      # Must run before actions/checkout: without a system `git`, checkout falls
+      # back to downloading a plain tarball (no .git directory), which then
+      # breaks dunamai's `git describe`-based version detection even once git
+      # itself gets installed later - checkout doesn't retroactively re-clone.
+      - name: Install system dependencies
+        run: |
+          pacman -Syu --noconfirm
+          pacman -S --noconfirm --needed \
+            webkit2gtk-4.1 base-devel curl wget file openssl \
+            appmenu-gtk-module libappindicator-gtk3 librsvg \
+            python python-pip git \
+            xdotool jq nodejs npm
+
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -29,15 +42,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: desktop-appimage
-
-      - name: Install system dependencies
-        run: |
-          pacman -Syu --noconfirm
-          pacman -S --noconfirm --needed \
-            webkit2gtk-4.1 base-devel curl wget file openssl \
-            appmenu-gtk-module libappindicator-gtk3 librsvg \
-            python python-pip git \
-            xdotool jq nodejs npm
 
       - name: Install pnpm
         run: npm install -g pnpm
