@@ -26,7 +26,7 @@ jobs:
           pacman -S --noconfirm --needed \
             webkit2gtk-4.1 base-devel curl wget file openssl \
             appmenu-gtk-module libappindicator-gtk3 librsvg \
-            python python-pip git \
+            python python-pip git xdg-utils \
             xdotool jq nodejs npm
           # Container runs as root, checked-out files end up owned by a different
           # uid than git expects by default, and git refuses to touch a repo it
