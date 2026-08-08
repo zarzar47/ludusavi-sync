@@ -33,6 +33,14 @@ jobs:
           # doesn't consider "ours" (dubious ownership, CVE-2022-24765 mitigation).
           # Blanket-trust everything in this throwaway container.
           git config --global --add safe.directory '*'
+          # linuxdeploy-plugin-gtk unconditionally copies
+          # /usr/lib/gdk-pixbuf-2.0/2.10.0 into the AppDir. That path only gets
+          # created by a pacman hook triggered when a loader *plugin* package
+          # (e.g. an image-format loader) installs a .so there - core formats
+          # are compiled into gdk-pixbuf2 itself now, so a plain gdk-pixbuf2
+          # install alone never creates it. Make it ourselves.
+          mkdir -p /usr/lib/gdk-pixbuf-2.0/2.10.0/loaders
+          gdk-pixbuf-query-loaders --update-cache
 
       - uses: actions/checkout@v4
         with:
