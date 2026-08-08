@@ -13,6 +13,7 @@ concurrency:
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
   tag:
@@ -24,10 +25,7 @@ jobs:
 
       - name: Bump patch version and tag
         # Pushing a branch (not a tag) can't retrigger this workflow, so no loop
-        # risk. The pushed tag *does* trigger desktop-build.yaml (on: push: tags:
-        # 'v*'), which builds the AppImage and attaches it to an auto-created
-        # release for that tag - so a push to main here is what chains into a
-        # published release, no separate manual tagging step needed.
+        # risk on this step itself.
         run: |
           git fetch --tags
           latest=$(git tag -l 'v*.*.*' | sort -V | tail -n1)
@@ -42,7 +40,18 @@ jobs:
             new="v${major}.${minor}.$((patch + 1))"
           fi
           echo "Latest: ${latest:-<none>} -> New: $new"
+          echo "NEW_TAG=$new" >> "$GITHUB_ENV"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git tag "$new"
           git push origin "$new"
+
+      - name: Trigger AppImage build
+        # A tag pushed with the default GITHUB_TOKEN (above) does NOT trigger
+        # other workflows' `push: tags` filters - GitHub Actions deliberately
+        # blocks GITHUB_TOKEN-authored events from cascading, to prevent
+        # infinite workflow loops. Dispatch desktop-build.yaml explicitly
+        # instead, on the tag we just pushed.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run desktop-build.yaml --ref "$NEW_TAG"

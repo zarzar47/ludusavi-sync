@@ -2,6 +2,12 @@ on:
   push:
     tags:
       - 'v*'
+  # auto-tag.yaml pushes the tag above using the default GITHUB_TOKEN, and
+  # GitHub Actions deliberately doesn't let a GITHUB_TOKEN-authored push
+  # trigger other workflows (anti-recursion guard) - so it dispatches this
+  # workflow explicitly instead. Manual `git push --tags` still hits the
+  # trigger above just fine, since that uses a real user token.
+  workflow_dispatch:
 
 name: Desktop AppImage Build
 
