@@ -25,7 +25,7 @@ jobs:
           pacman -Syu --noconfirm
           pacman -S --noconfirm --needed \
             webkit2gtk-4.1 base-devel curl wget file openssl \
-            appmenu-gtk-module libappindicator-gtk3 librsvg \
+            appmenu-gtk-module libappindicator-gtk3 librsvg gdk-pixbuf2 \
             python python-pip git xdg-utils fuse2 \
             xdotool jq nodejs npm
           # Container runs as root, checked-out files end up owned by a different
