@@ -1,0 +1,48 @@
+on:
+  push:
+    branches:
+      - main
+
+name: Auto-tag
+
+# Serialized so two pushes landing close together can't both compute the same
+# "next" version and race to push the same tag.
+concurrency:
+  group: auto-tag
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Bump patch version and tag
+        # Pushing a branch (not a tag) can't retrigger this workflow, so no loop
+        # risk. The pushed tag *does* trigger desktop-build.yaml (on: push: tags:
+        # 'v*'), which builds the AppImage and attaches it to an auto-created
+        # release for that tag - so a push to main here is what chains into a
+        # published release, no separate manual tagging step needed.
+        run: |
+          git fetch --tags
+          latest=$(git tag -l 'v*.*.*' | sort -V | tail -n1)
+          if [ -z "$latest" ]; then
+            new="v0.1.0"
+          else
+            ver="${latest#v}"
+            major="${ver%%.*}"
+            rest="${ver#*.}"
+            minor="${rest%%.*}"
+            patch="${rest#*.}"
+            new="v${major}.${minor}.$((patch + 1))"
+          fi
+          echo "Latest: ${latest:-<none>} -> New: $new"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag "$new"
+          git push origin "$new"

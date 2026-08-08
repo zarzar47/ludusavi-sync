@@ -132,6 +132,12 @@ pub enum Error {
         game: String,
         backup_prefix: String,
     },
+    /// Cover-art lookup (`Ludusavi::cover_art`) hit an I/O or network error fetching or
+    /// caching the image. A game simply having no Steam ID / no art is `Ok(None)`, not
+    /// this - this is only for actual failures.
+    CoverArtFetchFailed {
+        why: String,
+    },
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CommandError {

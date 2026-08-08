@@ -4,18 +4,21 @@
 // `sync push|pull|status` subcommand uses) - no subprocess, no JSON-stdio
 // hop. See AGENTS.md "Frontend Pivot" and CLAUDE.md for why.
 
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use ludusavi::{
     api::{CloudStatus, Ludusavi, parameters},
+    path::StrictPath,
     prelude::{Cancel, Finality},
     report::ApiGame,
-    resource::sync_state::GameSyncEntry,
+    resource::{SaveableResourceFile, sync_state::GameSyncEntry},
+    scan::registry::RegistryItem,
     sync::SyncProgress,
 };
 use serde::Serialize;
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 
 /// `Ludusavi::load()` needs `manifest.yaml` to already exist (via `ludusavi manifest
 /// update` or a prior GUI/CLI run), so on a fresh checkout it can fail. Hold that as
@@ -127,6 +130,42 @@ async fn sync_status(game: String, state: tauri::State<'_, AppState>) -> Result<
     with_ludusavi(&state, |l| Ok(l.sync_status(&game)))
 }
 
+/// Batched `sync_status`: one `settings.config` read for every requested game instead
+/// of one per game, for an always-visible per-card sync badge (see `sync_status_batch`
+/// on `Ludusavi`).
+#[tauri::command]
+async fn sync_status_batch(
+    games: Vec<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<HashMap<String, GameSyncEntry>, String> {
+    with_ludusavi(&state, |l| Ok(l.sync_status_batch(&games)))
+}
+
+#[derive(Serialize)]
+struct WinePrefixCheck {
+    /// Wine/Proton prefix(es) the game's latest backup recorded as its source.
+    backup_prefixes: Vec<String>,
+    /// Wine/Proton prefix(es) actually found on this machine right now.
+    local_prefixes: Vec<String>,
+    /// Every device's recorded prefix for this game, from `settings.config`.
+    registered: BTreeMap<String, String>,
+}
+
+/// Detects a restore hazard: the latest backup recorded a Wine/Proton prefix, but none
+/// was found locally. A CLI `ludusavi restore` would fail with `WinePrefixNotFound` (or
+/// silently misdirect if `scan.redirect_wine` is off) - there's no in-app restore yet,
+/// so this only warns rather than gating anything.
+#[tauri::command]
+async fn wine_prefix_check(game: String, state: tauri::State<'_, AppState>) -> Result<WinePrefixCheck, String> {
+    with_ludusavi(&state, |l| {
+        Ok(WinePrefixCheck {
+            backup_prefixes: l.backup_wine_prefixes(&game),
+            local_prefixes: l.wine_prefixes_for(&game),
+            registered: l.registered_prefixes(&game),
+        })
+    })
+}
+
 /// Games currently enabled for sync (`config.yaml`'s `sync.enabled_games`).
 #[tauri::command]
 async fn enabled_games(state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
@@ -137,6 +176,144 @@ async fn enabled_games(state: tauri::State<'_, AppState>) -> Result<Vec<String>,
 #[tauri::command]
 async fn search_games(query: String, state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
     with_ludusavi(&state, |l| Ok(l.search_games(&query, 50)))
+}
+
+/// Low-res Steam-style cover art for a game, as a `data:` URI the webview can drop
+/// straight into an `<img src>` - `None` when the game has no known Steam ID or Steam
+/// has no art for it, in which case the card just renders without one.
+///
+/// The Steam ID lookup only needs a quick read of the loaded manifest, but the fetch
+/// itself is a blocking HTTP call (`reqwest::blocking`, cached to disk after the first
+/// hit), so it runs on the async runtime's blocking pool rather than holding `state`'s
+/// lock across an await.
+#[tauri::command]
+async fn game_cover(game: String, state: tauri::State<'_, AppState>) -> Result<Option<String>, String> {
+    let steam_id = with_ludusavi(&state, |l| Ok(l.steam_id_for(&game)))?;
+    tauri::async_runtime::spawn_blocking(move || ludusavi::api::cover_art_for_game(&game, steam_id))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("{e:?}"))
+}
+
+/// Replace `game`'s cover art with a user-picked image (`source_path`, e.g. from the
+/// native file dialog the frontend opens via `@tauri-apps/plugin-dialog`). Returns the
+/// new cover as a `data:` URI so the card can update immediately.
+#[tauri::command]
+async fn set_custom_cover(game: String, source_path: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        ludusavi::api::set_custom_cover(&game, &StrictPath::from(source_path))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| format!("{e:?}"))
+}
+
+/// Revert `game` to its default cover art (Steam's, or none), undoing [`set_custom_cover`].
+#[tauri::command]
+async fn clear_custom_cover(game: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || ludusavi::api::clear_custom_cover(&game))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("{e:?}"))
+}
+
+/// One save file or registry entry found for a single game, for the per-game settings
+/// screen's include/exclude checklist.
+#[derive(Serialize)]
+struct ScanEntry {
+    path: String,
+    /// Whether it's currently excluded from backup/sync (`config.yaml`'s
+    /// `backup.toggledPaths`/`toggledRegistry`) - the checkbox's unchecked state.
+    ignored: bool,
+    kind: &'static str,
+}
+
+/// Save files (and, on Windows, registry entries) found for a single game - a
+/// single-game version of [`scan_games`]'s full-library preview, for the per-game
+/// settings screen opened by right-click/long-press on a card.
+#[tauri::command]
+async fn game_scan_entries(game: String, state: tauri::State<'_, AppState>) -> Result<Vec<ScanEntry>, String> {
+    with_ludusavi_mut(&state, |l| {
+        let output = l
+            .back_up(parameters::BackUp {
+                games: vec![game.clone()],
+                finality: Finality::Preview,
+                ..Default::default()
+            })
+            .map_err(|e| format!("{e:?}"))?;
+
+        let mut entries = Vec::new();
+        if let Some(ApiGame::Operative { files, registry, .. }) = output.games.get(&game) {
+            entries.extend(files.iter().map(|(path, file)| ScanEntry {
+                path: path.clone(),
+                ignored: file.ignored,
+                kind: "file",
+            }));
+            entries.extend(registry.iter().map(|(path, entry)| ScanEntry {
+                path: path.clone(),
+                ignored: entry.ignored,
+                kind: "registry",
+            }));
+        }
+        entries.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(entries)
+    })
+}
+
+/// Include or exclude one save file/registry entry from `game`'s backup/sync
+/// (`config.yaml`'s `backup.toggledPaths`/`toggledRegistry`), mirroring upstream
+/// ludusavi's per-file checkboxes. Returns the entry's new `ignored` state.
+#[tauri::command]
+async fn toggle_game_path(
+    game: String,
+    path: String,
+    kind: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<bool, String> {
+    with_ludusavi_mut(&state, |l| {
+        let ignored = if kind == "registry" {
+            let item = RegistryItem::new(path);
+            l.config.backup.toggled_registry.toggle(&game, &item, None);
+            l.config.backup.toggled_registry.is_ignored(&game, &item, None)
+        } else {
+            let item = StrictPath::new(path);
+            l.config.backup.toggled_paths.toggle(&game, &item);
+            l.config.backup.toggled_paths.is_ignored(&game, &item)
+        };
+        l.config.save();
+        Ok(ignored)
+    })
+}
+
+/// Set several save files/registry entries' included state at once (the settings
+/// modal's per-folder "select all"/"select none", for games with far too many
+/// individual files to click one at a time - e.g. Baldur's Gate 3). One
+/// `config.yaml` write for the whole batch rather than one per entry.
+#[tauri::command]
+async fn set_group_ignored(
+    game: String,
+    paths: Vec<String>,
+    kind: String,
+    ignored: bool,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    with_ludusavi_mut(&state, |l| {
+        for path in paths {
+            if kind == "registry" {
+                let item = RegistryItem::new(path);
+                if l.config.backup.toggled_registry.is_ignored(&game, &item, None) != ignored {
+                    l.config.backup.toggled_registry.toggle(&game, &item, None);
+                }
+            } else {
+                let item = StrictPath::new(path);
+                if l.config.backup.toggled_paths.is_ignored(&game, &item) != ignored {
+                    l.config.backup.toggled_paths.toggle(&game, &item);
+                }
+            }
+        }
+        l.config.save();
+        Ok(())
+    })
 }
 
 /// Enable or disable a game for cloud sync.
@@ -259,12 +436,21 @@ async fn cloud_status(state: tauri::State<'_, AppState>) -> Result<CloudStatus, 
 /// Configure Google Drive as the cloud remote.
 ///
 /// This drives rclone's own OAuth flow (opens a browser, waits for approval) and can
-/// take a while. Runs as an async command so the webview stays responsive.
+/// take a while. Takes an `AppHandle` (not `State`) so the whole call can run inside
+/// `spawn_blocking` - `State`'s lifetime is tied to this invocation and can't move into
+/// a `'static` closure, but `AppHandle` can, and re-derives `AppState` via `.state()`
+/// once inside. Without this the OAuth wait would tie up an async runtime thread for as
+/// long as the user takes to approve in their browser.
 #[tauri::command]
-async fn connect_google_drive(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    with_ludusavi_mut(&state, |l| {
-        l.set_cloud_remote_google_drive().map_err(|e| format!("{e:?}"))
+async fn connect_google_drive(app: tauri::AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        with_ludusavi_mut(&state, |l| {
+            l.set_cloud_remote_google_drive().map_err(|e| format!("{e:?}"))
+        })
     })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Tear down the configured cloud remote (both rclone's own config and ours).
@@ -292,10 +478,20 @@ async fn set_cloud_synchronize(enabled: bool, state: tauri::State<'_, AppState>)
     })
 }
 
+/// Manually point at the `rclone` binary, for when it's installed but not on `PATH`.
+#[tauri::command]
+async fn set_rclone_path(path: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    with_ludusavi_mut(&state, |l| {
+        l.set_rclone_path(path);
+        Ok(())
+    })
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(AppState {
             ludusavi: Mutex::new(load_ludusavi()),
             scan_cancel: Arc::new(AtomicBool::new(false)),
@@ -304,9 +500,17 @@ pub fn run() {
             sync_push,
             sync_pull,
             sync_status,
+            sync_status_batch,
+            wine_prefix_check,
             enabled_games,
             discovered_games,
             search_games,
+            game_cover,
+            set_custom_cover,
+            clear_custom_cover,
+            game_scan_entries,
+            toggle_game_path,
+            set_group_ignored,
             set_game_enabled,
             backup_game,
             scan_games,
@@ -315,7 +519,8 @@ pub fn run() {
             connect_google_drive,
             disconnect_cloud,
             set_cloud_path,
-            set_cloud_synchronize
+            set_cloud_synchronize,
+            set_rclone_path
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

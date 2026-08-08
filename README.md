@@ -89,6 +89,19 @@ pnpm install
 pnpm run tauri build            # produces AppImage in src-tauri/target/release/bundle/appimage/
 ```
 
+Or the one-shot version - checks prerequisites, builds, and copies the result
+to `Ludusavi-Sync.AppImage` at the repo root:
+
+```bash
+./desktop/scripts/build-appimage.sh
+```
+
+The resulting `.AppImage` is portable: `chmod +x` and run it on any Linux
+machine with FUSE, no install step. (The script sets `NO_STRIP=1` - Tauri's
+bundled `linuxdeploy` ships a `strip` too old for the `.relr.dyn` ELF section
+newer binutils/glibc emit, e.g. on current Arch/CachyOS; skipping strip just
+leaves the AppImage unstripped/larger, so it's a safe default everywhere.)
+
 For development with hot-reload:
 
 ```bash

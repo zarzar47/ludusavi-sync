@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 
@@ -615,6 +615,12 @@ impl Ludusavi {
         matches
     }
 
+    /// Steam app ID for a game, if the manifest knows one - the key for cover-art
+    /// lookups ([`cover_art_for_steam_id`]). Cheap/synchronous, unlike the lookup itself.
+    pub fn steam_id_for(&self, game: &str) -> Option<u32> {
+        self.manifest.0.get(game).and_then(|g| g.steam.id)
+    }
+
     /// Enable or disable a game for cloud sync (`config.yaml`'s `sync.enabled_games`).
     pub fn set_game_enabled(&mut self, game: &str, enabled: bool) {
         if enabled {
@@ -686,6 +692,20 @@ impl Ludusavi {
     pub fn sync_status(&self, game: &str) -> Option<crate::resource::sync_state::GameSyncEntry> {
         let game = self.title_finder.find_one_by_name(game)?;
         crate::sync::get_game_sync_info(&self.config.backup.path, &game)
+    }
+
+    /// Batched [`Self::sync_status`]: loads `settings.config` once instead of once per
+    /// game, for a UI that wants an always-visible sync badge on every starred game's
+    /// card rather than one on-demand lookup per click.
+    pub fn sync_status_batch(&self, games: &[String]) -> HashMap<String, crate::resource::sync_state::GameSyncEntry> {
+        let sync_state = SyncStateFile::load_from(&self.config.backup.path);
+        games
+            .iter()
+            .filter_map(|game| {
+                let canonical = self.title_finder.find_one_by_name(game)?;
+                sync_state.games.get(&canonical).cloned().map(|entry| (game.clone(), entry))
+            })
+            .collect()
     }
 
     /// Local Wine/Proton prefixes found for a game on this machine, best first.
@@ -792,6 +812,13 @@ impl Ludusavi {
         self.config.save();
     }
 
+    /// Manually point at the `rclone` binary, for when it's installed but not on `PATH`.
+    /// Re-validated by the next `cloud_status()` call via `App::is_valid`.
+    pub fn set_rclone_path(&mut self, path: String) {
+        self.config.apps.rclone.path = StrictPath::from(path);
+        self.config.save();
+    }
+
     /// Swap in a new remote, tearing down the old one first. Shared by every
     /// `set_cloud_remote_*` method; mirrors `cli.rs`'s `configure_cloud`.
     fn configure_cloud(&mut self, remote: Remote) -> Result<(), Error> {
@@ -890,6 +917,153 @@ pub mod parameters {
         pub locked: Option<bool>,
         pub comment: Option<String>,
     }
+}
+
+fn cover_art_fetch_failed(e: std::io::Error) -> Error {
+    Error::CoverArtFetchFailed { why: e.to_string() }
+}
+
+/// Best-effort `image/...` MIME type from a file extension, for the `data:` URI the
+/// webview expects. Defaults to jpeg (what every fetched Steam cover is) rather than
+/// failing outright on an unrecognized extension - worst case the browser sniffs it.
+fn guess_image_mime(path: &StrictPath) -> &'static str {
+    match path.as_std_path_buf().ok().and_then(|p| {
+        p.extension()
+            .map(|e| e.to_string_lossy().to_lowercase())
+            .map(|e| match e.as_str() {
+                "png" => "image/png",
+                "gif" => "image/gif",
+                "webp" => "image/webp",
+                "bmp" => "image/bmp",
+                _ => "image/jpeg",
+            })
+    }) {
+        Some(mime) => mime,
+        None => "image/jpeg",
+    }
+}
+
+fn read_as_data_uri(path: &StrictPath) -> Result<String, Error> {
+    use base64::prelude::*;
+
+    let mime = guess_image_mime(path);
+    let bytes = std::fs::read(path.as_std_path_buf().map_err(cover_art_fetch_failed)?).map_err(cover_art_fetch_failed)?;
+    Ok(format!("data:{mime};base64,{}", BASE64_STANDARD.encode(&bytes)))
+}
+
+/// Directory that user-supplied cover art overrides ([`set_custom_cover`]) live in,
+/// one file per game, named after the same folder-escaping the backup layout uses for
+/// game titles ([`crate::scan::layout::escape_folder_name`]) so arbitrary titles are
+/// safe filenames.
+fn custom_cover_dir() -> StrictPath {
+    app_dir().joined("covers").joined("custom")
+}
+
+/// A user-supplied cover for `game`, if [`set_custom_cover`] was ever called for it -
+/// checked before falling back to Steam art in [`cover_art_for_game`]. The extension
+/// is whatever the user's source image had, so this scans for it rather than assuming.
+fn find_custom_cover(game: &str) -> Option<StrictPath> {
+    let dir = custom_cover_dir();
+    let prefix = crate::scan::layout::escape_folder_name(game);
+    let entries = std::fs::read_dir(dir.as_std_path_buf().ok()?).ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if let Some(rest) = name.strip_prefix(&prefix)
+            && rest.starts_with('.')
+        {
+            return Some(StrictPath::from(entry.path()));
+        }
+    }
+    None
+}
+
+/// Low-resolution cover art for a game, in the same style as Steam's own library grid,
+/// for the sync screen's game cards. Prefers a user-supplied override
+/// ([`set_custom_cover`]) over Steam's own art. `Ok(None)` (not an error) means there's
+/// no override and either no Steam ID or Steam has no art for it - the UI should just
+/// render a blank card, not an error state. The Steam fetch is cached under the app dir
+/// (`covers/<id>.jpg`), so repeat calls (e.g. re-rendering the list) don't refetch.
+///
+/// Doesn't borrow `Ludusavi`/`Manifest` at all - callers on a shared/locked `Ludusavi`
+/// (like the Tauri backend) should look up the Steam ID via [`Ludusavi::steam_id_for`]
+/// first, drop that borrow, then call this off the async runtime's blocking pool (it
+/// does blocking I/O and, on a cache miss, an HTTP request).
+pub fn cover_art_for_game(game: &str, steam_id: Option<u32>) -> Result<Option<String>, Error> {
+    use base64::prelude::*;
+
+    if let Some(custom) = find_custom_cover(game) {
+        return Ok(Some(read_as_data_uri(&custom)?));
+    }
+
+    let Some(steam_id) = steam_id else {
+        return Ok(None);
+    };
+
+    let cache_file = app_dir().joined("covers").joined(format!("{steam_id}.jpg"));
+
+    let bytes = if cache_file.exists() {
+        std::fs::read(cache_file.as_std_path_buf().map_err(cover_art_fetch_failed)?).map_err(cover_art_fetch_failed)?
+    } else {
+        // The standard "library capsule" - Steam's own grid/box art, but far smaller
+        // than the `_2x` retina variant (tens of KB rather than low single-digit MB).
+        let url = format!("https://cdn.cloudflare.steamstatic.com/steam/apps/{steam_id}/library_600x900.jpg");
+        let response = crate::prelude::get_reqwest_blocking_client(crate::prelude::Security::Safe)
+            .get(&url)
+            .header(reqwest::header::USER_AGENT, &*crate::prelude::USER_AGENT)
+            .send()
+            .map_err(|e| Error::CoverArtFetchFailed { why: e.to_string() })?;
+        if !response.status().is_success() {
+            return Ok(None);
+        }
+        let bytes = response
+            .bytes()
+            .map_err(|e| Error::CoverArtFetchFailed { why: e.to_string() })?
+            .to_vec();
+
+        cache_file.create_parent_dir().map_err(cover_art_fetch_failed)?;
+        std::fs::write(cache_file.as_std_path_buf().map_err(cover_art_fetch_failed)?, &bytes)
+            .map_err(cover_art_fetch_failed)?;
+        bytes
+    };
+
+    Ok(Some(format!("data:image/jpeg;base64,{}", BASE64_STANDARD.encode(&bytes))))
+}
+
+/// Set a user-supplied cover art override for `game`, copied in from `source` (e.g. a
+/// path the user picked in a native file dialog). Replaces any previous override for
+/// this game, including ones with a different extension. Returns the new cover as a
+/// `data:` URI, ready to drop straight into the UI without a round-trip through
+/// [`cover_art_for_game`].
+///
+/// Doesn't borrow `Ludusavi` - safe to call off the async runtime's blocking pool.
+pub fn set_custom_cover(game: &str, source: &StrictPath) -> Result<String, Error> {
+    clear_custom_cover(game)?;
+
+    let extension = source
+        .as_std_path_buf()
+        .ok()
+        .and_then(|p| p.extension().map(|e| e.to_string_lossy().to_lowercase()))
+        .unwrap_or_else(|| "png".to_string());
+
+    let dest = custom_cover_dir().joined(format!("{}.{extension}", crate::scan::layout::escape_folder_name(game)));
+    dest.create_parent_dir().map_err(cover_art_fetch_failed)?;
+    std::fs::copy(
+        source.as_std_path_buf().map_err(cover_art_fetch_failed)?,
+        dest.as_std_path_buf().map_err(cover_art_fetch_failed)?,
+    )
+    .map_err(cover_art_fetch_failed)?;
+
+    read_as_data_uri(&dest)
+}
+
+/// Remove `game`'s cover art override, if any, reverting it to Steam's own art (or no
+/// art, if there's no Steam ID either). Not an error if there was nothing to remove.
+pub fn clear_custom_cover(game: &str) -> Result<(), Error> {
+    if let Some(existing) = find_custom_cover(game) {
+        std::fs::remove_file(existing.as_std_path_buf().map_err(cover_art_fetch_failed)?).map_err(cover_art_fetch_failed)?;
+    }
+    Ok(())
 }
 
 fn evaluate_games(

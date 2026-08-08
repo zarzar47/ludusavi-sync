@@ -46,15 +46,18 @@ jobs:
             desktop/src-tauri/tauri.conf.json > desktop/src-tauri/tauri.conf.json.tmp
           mv desktop/src-tauri/tauri.conf.json.tmp desktop/src-tauri/tauri.conf.json
 
-      - name: Install JS dependencies
-        working-directory: desktop
-        run: pnpm install
-
       - name: Build AppImage
-        working-directory: desktop
-        run: pnpm tauri build
+        # Same script/recipe as local one-shot builds (README "Building" ->
+        # desktop/scripts/build-appimage.sh) - one build process, not a second
+        # CI-only one that can drift. It also sets NO_STRIP=1, needed here: this
+        # Arch container's binutils emits `.relr.dyn` ELF sections that Tauri's
+        # bundled linuxdeploy ships a `strip` too old to handle.
+        run: ./desktop/scripts/build-appimage.sh
+
+      - name: Rename AppImage with version
+        run: mv Ludusavi-Sync.AppImage "Ludusavi-Sync-v${LUDUSAVI_VERSION}.AppImage"
 
       - name: Upload AppImage to release
         uses: softprops/action-gh-release@v2
         with:
-          files: desktop/src-tauri/target/release/bundle/appimage/*.AppImage
+          files: Ludusavi-Sync-v${{ env.LUDUSAVI_VERSION }}.AppImage

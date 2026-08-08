@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
 
 // Mirrors api::CloudStatus.
 interface CloudStatus {
@@ -69,6 +70,21 @@ export function CloudSettings() {
     }
   }
 
+  async function pickRclonePath() {
+    const picked = await open({ multiple: false, directory: false });
+    if (!picked || typeof picked !== "string") return;
+    setBusy(true);
+    setError(null);
+    try {
+      await invoke("set_rclone_path", { path: picked });
+      refresh();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function toggleSynchronize() {
     if (!status) return;
     setBusy(true);
@@ -94,10 +110,15 @@ export function CloudSettings() {
       {error && <p className="error-text">{error}</p>}
 
       {!status.rclone_valid && (
-        <p className="warning-text">
-          rclone not found ({status.rclone_path || "no path set"}). Install it and make
-          sure it's on your PATH, then reopen this screen.
-        </p>
+        <>
+          <p className="warning-text">
+            rclone not found ({status.rclone_path || "no path set"}). Install it and make
+            sure it's on your PATH, or point at the binary directly.
+          </p>
+          <button disabled={busy} onClick={pickRclonePath}>
+            Change rclone path…
+          </button>
+        </>
       )}
 
       {status.connected ? (
