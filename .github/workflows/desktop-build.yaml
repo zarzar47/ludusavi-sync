@@ -11,6 +11,9 @@ on:
 
 name: Desktop AppImage Build
 
+permissions:
+  contents: write
+
 jobs:
   build-appimage:
     runs-on: ubuntu-latest
