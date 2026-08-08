@@ -28,6 +28,11 @@ jobs:
             appmenu-gtk-module libappindicator-gtk3 librsvg \
             python python-pip git \
             xdotool jq nodejs npm
+          # Container runs as root, checked-out files end up owned by a different
+          # uid than git expects by default, and git refuses to touch a repo it
+          # doesn't consider "ours" (dubious ownership, CVE-2022-24765 mitigation).
+          # Blanket-trust everything in this throwaway container.
+          git config --global --add safe.directory '*'
 
       - uses: actions/checkout@v4
         with:
