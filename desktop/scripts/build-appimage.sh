@@ -46,7 +46,13 @@ echo "==> Building release AppImage (compiles the Rust backend - can take severa
 # `.relr.dyn` ELF section newer binutils/glibc emit ("unknown type [0x13]") - e.g. on
 # current Arch/CachyOS. Skipping strip just means a larger, unstripped AppImage, so
 # it's a safe default everywhere, not just a workaround for that failure.
-NO_STRIP=1 pnpm tauri build
+#
+# APPIMAGE_EXTRACT_AND_RUN=1: linuxdeploy (and the appimagetool it calls) ship as
+# AppImages themselves, which normally mount via FUSE to run - unavailable in most
+# Docker containers (no /dev/fuse), which fails as an opaque "failed to run
+# linuxdeploy". This makes them extract-and-run instead of mounting; harmless and a
+# bit slower on a machine that does have FUSE, so on by default rather than only in CI.
+NO_STRIP=1 APPIMAGE_EXTRACT_AND_RUN=1 pnpm tauri build
 
 bundle_dir="src-tauri/target/release/bundle/appimage"
 appimage=$(find "$bundle_dir" -maxdepth 1 -name '*.AppImage' -print -quit 2>/dev/null || true)
