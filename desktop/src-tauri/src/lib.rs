@@ -489,21 +489,27 @@ async fn set_rclone_path(path: String, state: tauri::State<'_, AppState>) -> Res
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // WebKitGTK/GTK's default GPU-accelerated rendering fails on several real
-    // setups this app targets - gamescope on Steam Deck ("Could not create
-    // default EGL display: EGL_BAD_PARAMETER", blank white window persisting
-    // even with just WEBKIT_DISABLE_DMABUF_RENDERER) and some Wayland/GPU
-    // driver combos on desktop Linux (desktop/scripts/dev.sh sets the DMA-BUF
-    // var for `tauri dev`, for the same underlying class of failure). The
-    // EGL_BAD_PARAMETER case happens at raw EGL display creation - below
-    // WebKit's own compositor, so disabling just its DMA-BUF renderer isn't
-    // enough; it's GTK's GL context init itself failing under gamescope's
-    // nested compositor. This app has no need for GPU-accelerated rendering
-    // (it's a settings/file-list UI, not a game), so force software
-    // rendering outright rather than chasing every GPU/EGL-platform mismatch
-    // individually. Bakes into the binary so an AppImage works out of the box
-    // - don't overwrite a var the user already set themselves.
+    // WebKitGTK fails to initialize under gamescope's nested Wayland compositor
+    // on Steam Deck: "Could not create default EGL display: EGL_BAD_PARAMETER.
+    // Aborting..." followed by the WebKitWebProcess (renderer) crashing
+    // outright, leaving just the native window chrome with a blank content
+    // area. Confirmed LIVE on real Deck hardware (strace + coredumpctl) that
+    // none of these vars alone fix it - GDK_BACKEND=x11 in particular does
+    // *not* help despite desktop/scripts/dev.sh's `tauri dev` fallback using
+    // it for a superficially similar symptom, because the AppImage's own
+    // linuxdeploy-plugin-gtk AppRun hook already forces GDK_BACKEND=x11
+    // unconditionally before this binary ever runs, and the crash still
+    // happened every time regardless. Root cause turned out to be a WebKitGTK
+    // regression, not an env var this app controls: versions after 2.44.x
+    // break exactly this way on Wayland-adjacent compositors (see
+    // .github/workflows/desktop-build.yaml "Pin libwebkit2gtk" for the actual
+    // fix - pinning the build's WebKitGTK to a pre-regression version).
+    // Keeping these vars set is still a reasonable default (cheap, harmless,
+    // helps unrelated Wayland/GPU-driver combos on desktop Linux) but they
+    // are not what fixes Steam Deck. Don't overwrite a var the user already
+    // set themselves.
     for (key, value) in [
+        ("GDK_BACKEND", "x11"),
         ("WEBKIT_DISABLE_DMABUF_RENDERER", "1"),
         ("WEBKIT_DISABLE_COMPOSITING_MODE", "1"),
         ("LIBGL_ALWAYS_SOFTWARE", "1"),

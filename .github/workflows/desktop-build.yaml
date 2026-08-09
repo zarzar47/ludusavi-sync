@@ -48,14 +48,50 @@ jobs:
       - name: Install system dependencies
         # Tauri's own documented Ubuntu prerequisite list, plus jq (version
         # injection below) and xdg-utils (linuxdeploy shells out to xdg-open
-        # while bundling).
+        # while bundling). libwebkit2gtk-4.1-dev is deliberately NOT here -
+        # see "Pin libwebkit2gtk" below, it needs a specific old version, not
+        # whatever's currently in jammy-updates.
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev build-essential curl wget file \
+            build-essential curl wget file \
             libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev \
             libxcb-composite0-dev \
             jq xdg-utils
+
+      - name: Pin libwebkit2gtk to a pre-regression version
+        # WebKitGTK versions after 2.44.x crash on startup under gamescope on
+        # Steam Deck (and other Wayland-adjacent compositors/GPU combos):
+        # "Could not create default EGL display: EGL_BAD_PARAMETER. Aborting
+        # ..." in the WebKitWebProcess, leaving just a blank window - a
+        # WebKit regression several other Tauri/Electron-alternative apps
+        # hit the same way (gitbutlerapp/gitbutler#5282 + #5301,
+        # NoRiskClient/issues#597). Confirmed LIVE on real Deck hardware for
+        # this app: strace + a wide battery of env vars (WEBKIT_DISABLE_*,
+        # LIBGL_ALWAYS_SOFTWARE, GDK_BACKEND=x11, EGL_PLATFORM=x11,
+        # WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1, alone and combined) do
+        # NOT avoid it - see desktop/src-tauri/src/lib.rs::run for the full
+        # writeup. jammy-updates now ships well past the break (2.50.x as of
+        # writing); pull the last known-good series (2.44.3-0ubuntu0.22.04.1,
+        # current from 2024-09-05 to 2024-10-12 before 2.46 superseded it)
+        # from Ubuntu's archive snapshot service instead, and hold it so
+        # nothing later in this job upgrades it back.
+        run: |
+          echo "deb http://snapshot.ubuntu.com/ubuntu/20240920T000000Z jammy-updates main universe" | \
+            sudo tee /etc/apt/sources.list.d/webkit-pin.list
+          sudo apt-get update \
+            -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/webkit-pin.list \
+            -o Dir::Etc::sourceparts=-
+          sudo apt-get install -y --allow-downgrades \
+            libwebkit2gtk-4.1-0=2.44.3-0ubuntu0.22.04.1 \
+            libwebkit2gtk-4.1-dev=2.44.3-0ubuntu0.22.04.1 \
+            libjavascriptcoregtk-4.1-0=2.44.3-0ubuntu0.22.04.1 \
+            libjavascriptcoregtk-4.1-dev=2.44.3-0ubuntu0.22.04.1 \
+            gir1.2-webkit2-4.1=2.44.3-0ubuntu0.22.04.1 \
+            gir1.2-javascriptcoregtk-4.1=2.44.3-0ubuntu0.22.04.1
+          sudo apt-mark hold \
+            libwebkit2gtk-4.1-0 libwebkit2gtk-4.1-dev \
+            libjavascriptcoregtk-4.1-0 libjavascriptcoregtk-4.1-dev
 
       - name: Install pnpm
         run: npm install -g pnpm
