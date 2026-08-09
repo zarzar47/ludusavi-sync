@@ -489,6 +489,19 @@ async fn set_rclone_path(path: String, state: tauri::State<'_, AppState>) -> Res
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // WebKitGTK's default DMA-BUF/EGL renderer fails on several real setups this
+    // app targets - gamescope on Steam Deck ("Could not create default EGL
+    // display: EGL_BAD_PARAMETER", blank white window) and some Wayland/GPU
+    // driver combos on desktop Linux (desktop/scripts/dev.sh sets the same var
+    // for `tauri dev` for the identical reason). Bake it into the packaged
+    // binary itself so an AppImage works out of the box - don't overwrite it if
+    // the user already set their own value.
+    if std::env::var("WEBKIT_DISABLE_DMABUF_RENDERER").is_err() {
+        unsafe {
+            std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+        }
+    }
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
