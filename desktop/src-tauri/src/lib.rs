@@ -489,16 +489,29 @@ async fn set_rclone_path(path: String, state: tauri::State<'_, AppState>) -> Res
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // WebKitGTK's default DMA-BUF/EGL renderer fails on several real setups this
-    // app targets - gamescope on Steam Deck ("Could not create default EGL
-    // display: EGL_BAD_PARAMETER", blank white window) and some Wayland/GPU
-    // driver combos on desktop Linux (desktop/scripts/dev.sh sets the same var
-    // for `tauri dev` for the identical reason). Bake it into the packaged
-    // binary itself so an AppImage works out of the box - don't overwrite it if
-    // the user already set their own value.
-    if std::env::var("WEBKIT_DISABLE_DMABUF_RENDERER").is_err() {
-        unsafe {
-            std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    // WebKitGTK/GTK's default GPU-accelerated rendering fails on several real
+    // setups this app targets - gamescope on Steam Deck ("Could not create
+    // default EGL display: EGL_BAD_PARAMETER", blank white window persisting
+    // even with just WEBKIT_DISABLE_DMABUF_RENDERER) and some Wayland/GPU
+    // driver combos on desktop Linux (desktop/scripts/dev.sh sets the DMA-BUF
+    // var for `tauri dev`, for the same underlying class of failure). The
+    // EGL_BAD_PARAMETER case happens at raw EGL display creation - below
+    // WebKit's own compositor, so disabling just its DMA-BUF renderer isn't
+    // enough; it's GTK's GL context init itself failing under gamescope's
+    // nested compositor. This app has no need for GPU-accelerated rendering
+    // (it's a settings/file-list UI, not a game), so force software
+    // rendering outright rather than chasing every GPU/EGL-platform mismatch
+    // individually. Bakes into the binary so an AppImage works out of the box
+    // - don't overwrite a var the user already set themselves.
+    for (key, value) in [
+        ("WEBKIT_DISABLE_DMABUF_RENDERER", "1"),
+        ("WEBKIT_DISABLE_COMPOSITING_MODE", "1"),
+        ("LIBGL_ALWAYS_SOFTWARE", "1"),
+    ] {
+        if std::env::var(key).is_err() {
+            unsafe {
+                std::env::set_var(key, value);
+            }
         }
     }
 
