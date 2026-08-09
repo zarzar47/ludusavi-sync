@@ -16,35 +16,21 @@ permissions:
 
 jobs:
   build-appimage:
-    runs-on: ubuntu-latest
-    container: archlinux:latest
+    # Ubuntu 22.04 (glibc 2.35), not a rolling-release Arch container: an
+    # AppImage bundles its runtime libs (webkit2gtk, glib, ...) as compiled,
+    # and those still need a glibc on the *target* machine new enough to
+    # satisfy the symbol versions they were built against. glibc is
+    # backwards-compatible, not forwards-compatible, so building on Arch's
+    # bleeding-edge glibc produced an AppImage that flatly wouldn't run on a
+    # Steam Deck (SteamOS 3.8.16 ships glibc 2.41 - a whole version behind
+    # what that build required). Building on an older LTS base is the
+    # standard AppImage practice for exactly this reason, and it's also
+    # Tauri's own documented Linux CI baseline - the plain GitHub-hosted
+    # runner has git/python/FUSE already, sidestepping every Arch-container
+    # workaround (missing git, PEP 668 pip, missing FUSE, gdk-pixbuf loader
+    # cache) this workflow needed before.
+    runs-on: ubuntu-22.04
     steps:
-      # Must run before actions/checkout: without a system `git`, checkout falls
-      # back to downloading a plain tarball (no .git directory), which then
-      # breaks dunamai's `git describe`-based version detection even once git
-      # itself gets installed later - checkout doesn't retroactively re-clone.
-      - name: Install system dependencies
-        run: |
-          pacman -Syu --noconfirm
-          pacman -S --noconfirm --needed \
-            webkit2gtk-4.1 base-devel curl wget file openssl \
-            appmenu-gtk-module libappindicator-gtk3 librsvg gdk-pixbuf2 \
-            python python-pip git xdg-utils fuse2 \
-            xdotool jq nodejs npm
-          # Container runs as root, checked-out files end up owned by a different
-          # uid than git expects by default, and git refuses to touch a repo it
-          # doesn't consider "ours" (dubious ownership, CVE-2022-24765 mitigation).
-          # Blanket-trust everything in this throwaway container.
-          git config --global --add safe.directory '*'
-          # linuxdeploy-plugin-gtk unconditionally copies
-          # /usr/lib/gdk-pixbuf-2.0/2.10.0 into the AppDir. That path only gets
-          # created by a pacman hook triggered when a loader *plugin* package
-          # (e.g. an image-format loader) installs a .so there - core formats
-          # are compiled into gdk-pixbuf2 itself now, so a plain gdk-pixbuf2
-          # install alone never creates it. Make it ourselves.
-          mkdir -p /usr/lib/gdk-pixbuf-2.0/2.10.0/loaders
-          gdk-pixbuf-query-loaders --update-cache
-
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -57,7 +43,18 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: desktop-appimage
+          key: desktop-appimage-ubuntu
+
+      - name: Install system dependencies
+        # Tauri's own documented Ubuntu prerequisite list, plus jq (version
+        # injection below) and xdg-utils (linuxdeploy shells out to xdg-open
+        # while bundling).
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev build-essential curl wget file \
+            libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev \
+            jq xdg-utils
 
       - name: Install pnpm
         run: npm install -g pnpm
@@ -66,11 +63,6 @@ jobs:
         with:
           env-var: LUDUSAVI_VERSION
           args: --style semver
-        env:
-          # dunamai-action plain `pip install`s itself, which Arch's pip refuses
-          # by default (PEP 668 externally-managed-environment). This is the
-          # standard override, not a real risk here - it's a throwaway CI container.
-          PIP_BREAK_SYSTEM_PACKAGES: "1"
 
       - name: Inject version into tauri.conf.json
         run: |
@@ -81,9 +73,7 @@ jobs:
       - name: Build AppImage
         # Same script/recipe as local one-shot builds (README "Building" ->
         # desktop/scripts/build-appimage.sh) - one build process, not a second
-        # CI-only one that can drift. It also sets NO_STRIP=1, needed here: this
-        # Arch container's binutils emits `.relr.dyn` ELF sections that Tauri's
-        # bundled linuxdeploy ships a `strip` too old to handle.
+        # CI-only one that can drift.
         run: ./desktop/scripts/build-appimage.sh
 
       - name: Rename AppImage with version
