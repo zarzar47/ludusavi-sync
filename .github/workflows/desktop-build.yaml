@@ -75,13 +75,17 @@ jobs:
         # writing); pull the last known-good series (2.44.3-0ubuntu0.22.04.1,
         # current from 2024-09-05 to 2024-10-12 before 2.46 superseded it)
         # from Ubuntu's archive snapshot service instead, and hold it so
-        # nothing later in this job upgrades it back.
+        # nothing later in this job upgrades it back. Full `apt-get update`
+        # (not restricted to just this new source via Dir::Etc::sourcelist) -
+        # verified via a local Ubuntu-22.04 rebuild that restricting it drops
+        # jammy/jammy-updates main+universe from apt's lists (List-Cleanup),
+        # which then breaks dependency resolution for these packages
+        # (gstreamer1.0-plugins-*, libsecret-1-0, libhyphen0, etc. all live
+        # in main/universe, not this snapshot-only source).
         run: |
           echo "deb http://snapshot.ubuntu.com/ubuntu/20240920T000000Z jammy-updates main universe" | \
             sudo tee /etc/apt/sources.list.d/webkit-pin.list
-          sudo apt-get update \
-            -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/webkit-pin.list \
-            -o Dir::Etc::sourceparts=-
+          sudo apt-get update
           sudo apt-get install -y --allow-downgrades \
             libwebkit2gtk-4.1-0=2.44.3-0ubuntu0.22.04.1 \
             libwebkit2gtk-4.1-dev=2.44.3-0ubuntu0.22.04.1 \
