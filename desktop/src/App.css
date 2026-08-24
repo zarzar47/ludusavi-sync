@@ -128,11 +128,17 @@ button {
   box-sizing: border-box;
 }
 
-/* Card grid, Steam-library-style: fixed-ish portrait tiles that wrap and reflow
-   with the window instead of the old one-row-per-game list. */
+/* Card grid, Steam-library-style: fixed-ish portrait tiles that wrap and reflow with
+   the window instead of the old one-row-per-game list. Flexbox wrap, not CSS Grid: the
+   pinned WebKitGTK build on Steam Deck has a confirmed-live row-sizing bug with
+   `display: grid` + `grid-template-columns: repeat(auto-fill, ...)` here - each auto
+   row sized itself to the cover image alone, silently clipping (or in some cases
+   overlapping onto the next row) the name/actions body beneath it despite correct
+   DOM/CSS. Flex-wrap gets the same "fill the row, wrap to the next" behavior via a
+   much simpler, longer-supported layout algorithm. */
 .game-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  display: flex;
+  flex-wrap: wrap;
   gap: 1em;
   max-width: 960px;
   margin: 1em auto;
@@ -144,6 +150,7 @@ button {
 .game-card {
   display: flex;
   flex-direction: column;
+  flex: 1 1 150px;
   border-radius: 8px;
   overflow: hidden;
   background-color: #ffffff;
