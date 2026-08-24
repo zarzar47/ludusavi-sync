@@ -441,12 +441,22 @@ async fn cloud_status(state: tauri::State<'_, AppState>) -> Result<CloudStatus, 
 /// a `'static` closure, but `AppHandle` can, and re-derives `AppState` via `.state()`
 /// once inside. Without this the OAuth wait would tie up an async runtime thread for as
 /// long as the user takes to approve in their browser.
+///
+/// Emits a `"cloud-auth-url"` event with the link as soon as rclone prints it, well
+/// before this command returns - rclone's own browser auto-open isn't reliable (e.g. a
+/// broken/missing default-browser association just does nothing, confirmed live on
+/// this project's own dev Steam Deck), so the frontend should always display this link
+/// for the user to open/paste manually rather than assume a browser popped up.
 #[tauri::command]
 async fn connect_google_drive(app: tauri::AppHandle) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        with_ludusavi_mut(&state, |l| {
-            l.set_cloud_remote_google_drive().map_err(|e| format!("{e:?}"))
+        let event_app = app.clone();
+        with_ludusavi_mut(&state, move |l| {
+            l.set_cloud_remote_google_drive(move |url| {
+                let _ = event_app.emit("cloud-auth-url", url.to_string());
+            })
+            .map_err(|e| format!("{e:?}"))
         })
     })
     .await

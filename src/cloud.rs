@@ -591,12 +591,148 @@ impl Rclone {
         run_command(self.app.path.raw(), &args, success, privacy)
     }
 
+    /// Like `run`, but reads stdout/stderr line-by-line as the child produces them and
+    /// calls `on_url_line` for every line that contains an `http://`/`https://` URL,
+    /// instead of only returning once the process has fully exited. See
+    /// `configure_remote_reporting_url` for why `configure_remote` needs this and
+    /// nothing else currently does.
+    fn run_streaming(
+        &self,
+        args: &[String],
+        success: &[i32],
+        privacy: Privacy,
+        mut on_url_line: impl FnMut(&str),
+    ) -> Result<CommandOutput, CommandError> {
+        let args = self.args(args);
+        let executable = self.app.path.raw().to_string();
+
+        let collect_args = || {
+            if privacy.sensitive() {
+                vec!["**REDACTED**".to_string()]
+            } else {
+                args.clone()
+            }
+        };
+
+        let mut command = std::process::Command::new(&executable);
+        command
+            .args(&args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(windows::Win32::System::Threading::CREATE_NO_WINDOW.0);
+        }
+
+        log::debug!("Running command: {} {:?}", executable, collect_args());
+
+        let mut child = command.spawn().map_err(|e| CommandError::Launched {
+            program: executable.clone(),
+            args: collect_args(),
+            raw: e.to_string(),
+        })?;
+
+        let stdout = child.stdout.take().expect("child stdout was piped");
+        let stderr = child.stderr.take().expect("child stderr was piped");
+
+        // Both streams are drained on their own threads and funneled through a single
+        // channel back to this thread - reading only one stream synchronously risks a
+        // deadlock if the *other*, unread one fills its OS pipe buffer and blocks the
+        // child's write. The channel also means `on_url_line` only ever runs here, not
+        // from the reader threads, so it doesn't need to be `Send`.
+        let (tx, rx) = std::sync::mpsc::channel::<(bool, String)>();
+        let tx_stderr = tx.clone();
+        let stdout_thread = std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if tx.send((false, line)).is_err() {
+                    break;
+                }
+            }
+        });
+        let stderr_thread = std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                if tx_stderr.send((true, line)).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let mut stdout_buf = String::new();
+        let mut stderr_buf = String::new();
+        for (is_stderr, line) in rx {
+            // rclone's OAuth setup also logs an earlier, unrelated line containing a
+            // bare `http://127.0.0.1:PORT/` ("Make sure your Redirect URL is set to
+            // ..."), so matching on any http(s) URL fires on that one first. The actual
+            // link to open always carries a `state=` CSRF token in the query string;
+            // that notice line never does, so require it to tell them apart.
+            if let Some(start) = line.find("http://").or_else(|| line.find("https://"))
+                && line[start..].contains("state=")
+            {
+                on_url_line(line[start..].trim());
+            }
+            let buf = if is_stderr { &mut stderr_buf } else { &mut stdout_buf };
+            buf.push_str(&line);
+            buf.push('\n');
+        }
+        let _ = stdout_thread.join();
+        let _ = stderr_thread.join();
+
+        let status = child.wait().map_err(|_| CommandError::Terminated {
+            program: executable.clone(),
+            args: collect_args(),
+        })?;
+
+        let stdout_buf = stdout_buf.trim().to_string();
+        let stderr_buf = stderr_buf.trim().to_string();
+        let code = status.code().unwrap_or(1);
+
+        if success.contains(&code) {
+            log::debug!("Command succeeded with {code}: {executable}");
+            Ok(CommandOutput {
+                code,
+                stdout: stdout_buf,
+                stderr: stderr_buf,
+            })
+        } else {
+            log::error!("Command failed with {code}: {executable}");
+            log::error!("Command stdout: {stdout_buf}");
+            log::error!("Command stderr: {stderr_buf}");
+            Err(CommandError::Exited {
+                program: executable,
+                args: collect_args(),
+                code,
+                stdout: (!stdout_buf.is_empty()).then_some(stdout_buf),
+                stderr: (!stderr_buf.is_empty()).then_some(stderr_buf),
+            })
+        }
+    }
+
     fn obscure(&self, credential: &str) -> Result<String, CommandError> {
         let out = self.run(&["obscure".to_string(), credential.to_string()], &[0], Privacy::Private)?;
         Ok(out.stdout)
     }
 
     pub fn configure_remote(&self) -> Result<(), CommandError> {
+        self.configure_remote_reporting_url(|_| {})
+    }
+
+    /// Same as `configure_remote`, but calls `on_auth_url` as soon as rclone prints
+    /// the OAuth browser link (Box/Dropbox/Google Drive/OneDrive all drive rclone's
+    /// own OAuth flow here), rather than only after the whole command finishes.
+    ///
+    /// This exists because `run`/`run_command` capture output via `Command::output()`,
+    /// which blocks until the child process *fully exits* - for these remotes, that
+    /// means only after the user has already finished (or given up on) the browser
+    /// approval, which can take minutes. If rclone can't auto-open a browser itself
+    /// (e.g. no working default-browser association, as seen live on this project's
+    /// own dev Steam Deck), the link it prints as a fallback was never reaching the
+    /// caller until it was already too late to be useful - the process just seemed to
+    /// hang with zero feedback. Streaming stdout/stderr line-by-line via
+    /// `run_streaming` instead lets the caller show that link immediately, so the user
+    /// can always copy/paste it manually regardless of whether auto-open works.
+    pub fn configure_remote_reporting_url(&self, on_auth_url: impl FnMut(&str)) -> Result<(), CommandError> {
         if !self.remote.needs_configuration() {
             return Ok(());
         }
@@ -635,7 +771,7 @@ impl Rclone {
             args.extend(config_args);
         }
 
-        self.run(&args, &[0], privacy)?;
+        self.run_streaming(&args, &[0], privacy, on_auth_url)?;
         Ok(())
     }
 

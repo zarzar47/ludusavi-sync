@@ -525,6 +525,15 @@ button {
   color: #b8860b;
 }
 
+.auth-url-box {
+  margin-top: 0.75em;
+}
+
+.auth-url-box .row input {
+  flex: 1;
+  min-width: 0;
+}
+
 .scanning-indicator {
   display: flex;
   align-items: center;

@@ -784,10 +784,19 @@ impl Ludusavi {
     /// flow (it opens a browser and waits for the user to approve access). That's a
     /// blocking, possibly slow, network+UI operation - call this from a background
     /// thread, not directly on a UI event loop.
-    pub fn set_cloud_remote_google_drive(&mut self) -> Result<(), Error> {
-        self.configure_cloud(Remote::GoogleDrive {
-            id: Remote::generate_id(),
-        })
+    ///
+    /// `on_auth_url` is called as soon as rclone prints the browser link, before this
+    /// method returns - rclone's own auto-open (`xdg-open` and friends) isn't reliable
+    /// (e.g. a broken/missing default-browser association just silently does nothing,
+    /// confirmed live on this project's own dev Steam Deck), so the caller should always
+    /// show this link so the user can open/paste it manually as a fallback.
+    pub fn set_cloud_remote_google_drive(&mut self, on_auth_url: impl FnMut(&str)) -> Result<(), Error> {
+        self.configure_cloud_reporting_url(
+            Remote::GoogleDrive {
+                id: Remote::generate_id(),
+            },
+            on_auth_url,
+        )
     }
 
     /// Remove the configured cloud remote, both from `rclone`'s own config and here.
@@ -820,14 +829,16 @@ impl Ludusavi {
     }
 
     /// Swap in a new remote, tearing down the old one first. Shared by every
-    /// `set_cloud_remote_*` method; mirrors `cli.rs`'s `configure_cloud`.
-    fn configure_cloud(&mut self, remote: Remote) -> Result<(), Error> {
+    /// `set_cloud_remote_*` method; mirrors `cli.rs`'s `configure_cloud`. Forwards to
+    /// `Rclone::configure_remote_reporting_url` so a caller driving an OAuth-based
+    /// remote can surface the auth link immediately (pass `|_| {}` to ignore it).
+    fn configure_cloud_reporting_url(&mut self, remote: Remote, on_auth_url: impl FnMut(&str)) -> Result<(), Error> {
         if let Some(old_remote) = self.config.cloud.remote.as_ref() {
             let _ = Rclone::new(self.config.apps.rclone.clone(), old_remote.clone()).unconfigure_remote();
         }
 
         Rclone::new(self.config.apps.rclone.clone(), remote.clone())
-            .configure_remote()
+            .configure_remote_reporting_url(on_auth_url)
             .map_err(Error::UnableToConfigureCloud)?;
 
         self.config.cloud.remote = Some(remote);

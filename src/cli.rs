@@ -1472,8 +1472,16 @@ fn configure_cloud(config: &mut Config, remote: Remote) -> Result<(), Error> {
         _ = Rclone::new(config.apps.rclone.clone(), old_remote.clone()).unconfigure_remote();
     }
 
+    // For Box/Dropbox/Google Drive/OneDrive, this is where rclone drives its own OAuth
+    // flow and tries to auto-open a browser - which isn't reliable (broken/missing
+    // default-browser association, headless SSH session, etc.). Print the link the
+    // moment rclone reports it rather than waiting for the whole (possibly
+    // minutes-long) command to finish, so it's always available to open/paste
+    // manually instead of the CLI just appearing to hang.
     Rclone::new(config.apps.rclone.clone(), remote.clone())
-        .configure_remote()
+        .configure_remote_reporting_url(|url| {
+            println!("Open this link in a browser to finish connecting: {url}");
+        })
         .map_err(Error::UnableToConfigureCloud)?;
 
     config.cloud.remote = Some(remote);
