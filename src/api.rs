@@ -799,6 +799,33 @@ impl Ludusavi {
         )
     }
 
+    /// Split version of `set_cloud_remote_google_drive`, for a caller that can't hold
+    /// `&mut self` for rclone's OAuth wait - namely the Tauri backend, where `Ludusavi`
+    /// sits behind one shared mutex that every command locks. Holding it across the
+    /// wait (which blocks on browser approval and can take minutes, or hang forever if
+    /// abandoned) would stall every other command - Scan included - until it resolves.
+    ///
+    /// Tears down whatever remote is currently configured, then returns an `Rclone`
+    /// primed for the new one and the `Remote` to pass to `commit_cloud_remote` once
+    /// the caller has run `Rclone::configure_remote_reporting_url` on it (with the
+    /// state lock released) and it succeeded.
+    pub fn begin_cloud_remote_google_drive(&self) -> (Rclone, Remote) {
+        if let Some(old_remote) = self.config.cloud.remote.as_ref() {
+            let _ = Rclone::new(self.config.apps.rclone.clone(), old_remote.clone()).unconfigure_remote();
+        }
+        let remote = Remote::GoogleDrive {
+            id: Remote::generate_id(),
+        };
+        (Rclone::new(self.config.apps.rclone.clone(), remote.clone()), remote)
+    }
+
+    /// Persists a remote configured via `begin_cloud_remote_google_drive`'s `Rclone` -
+    /// call only once that succeeded.
+    pub fn commit_cloud_remote(&mut self, remote: Remote) {
+        self.config.cloud.remote = Some(remote);
+        self.config.save();
+    }
+
     /// Remove the configured cloud remote, both from `rclone`'s own config and here.
     pub fn disconnect_cloud_remote(&mut self) -> Result<(), Error> {
         if let Some(old) = self.config.cloud.remote.take() {

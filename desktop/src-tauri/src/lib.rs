@@ -436,11 +436,19 @@ async fn cloud_status(state: tauri::State<'_, AppState>) -> Result<CloudStatus, 
 /// Configure Google Drive as the cloud remote.
 ///
 /// This drives rclone's own OAuth flow (opens a browser, waits for approval) and can
-/// take a while. Takes an `AppHandle` (not `State`) so the whole call can run inside
-/// `spawn_blocking` - `State`'s lifetime is tied to this invocation and can't move into
-/// a `'static` closure, but `AppHandle` can, and re-derives `AppState` via `.state()`
-/// once inside. Without this the OAuth wait would tie up an async runtime thread for as
-/// long as the user takes to approve in their browser.
+/// take a while - or hang indefinitely if the user never finishes it. Takes an
+/// `AppHandle` (not `State`) so the whole call can run inside `spawn_blocking` -
+/// `State`'s lifetime is tied to this invocation and can't move into a `'static`
+/// closure, but `AppHandle` can, and re-derives `AppState` via `.state()` once inside.
+///
+/// Deliberately only locks `AppState`'s shared `Ludusavi` mutex twice, briefly, around
+/// the OAuth wait rather than for its whole duration (via
+/// `begin_cloud_remote_google_drive`/`commit_cloud_remote` instead of the one-shot
+/// `set_cloud_remote_google_drive`) - every other command (Scan included) locks that
+/// same mutex, so holding it for the wait would stall all of them until the user
+/// finishes approving in the browser, confirmed live as the cause of Scan silently
+/// hanging on this project's own dev Steam Deck after a Google Drive connect was left
+/// dangling.
 ///
 /// Emits a `"cloud-auth-url"` event with the link as soon as rclone prints it, well
 /// before this command returns - rclone's own browser auto-open isn't reliable (e.g. a
@@ -451,12 +459,19 @@ async fn cloud_status(state: tauri::State<'_, AppState>) -> Result<CloudStatus, 
 async fn connect_google_drive(app: tauri::AppHandle) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
+        let (rclone, remote) = with_ludusavi(&state, |l| Ok(l.begin_cloud_remote_google_drive()))?;
+
         let event_app = app.clone();
-        with_ludusavi_mut(&state, move |l| {
-            l.set_cloud_remote_google_drive(move |url| {
+        rclone
+            .configure_remote_reporting_url(move |url| {
                 let _ = event_app.emit("cloud-auth-url", url.to_string());
             })
-            .map_err(|e| format!("{e:?}"))
+            .map_err(|e| format!("{e:?}"))?;
+
+        let state = app.state::<AppState>();
+        with_ludusavi_mut(&state, |l| {
+            l.commit_cloud_remote(remote);
+            Ok(())
         })
     })
     .await
