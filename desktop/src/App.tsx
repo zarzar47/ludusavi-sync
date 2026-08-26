@@ -241,6 +241,23 @@ function SyncScreen({
     }
   }
 
+  async function restore(game: string) {
+    // Restores the latest local backup over the current save - no cloud involved,
+    // just undoing back to what's already in backup storage. Destructive, confirm first.
+    if (!window.confirm(`Restore "${game}" from its latest local backup? This will overwrite your current local save.`)) {
+      return;
+    }
+    setBusy(game);
+    setError(null);
+    try {
+      await invoke<number>("restore_game", { game });
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(null);
+    }
+  }
+
   // Run a push or pull, streaming the backend's "sync-progress" events into the
   // matching game's bar. The event listener is torn down when the invoke settles.
   async function syncTransfer(game: string, op: "sync_push" | "sync_pull") {
@@ -269,6 +286,11 @@ function SyncScreen({
   }
 
   async function pull(game: string) {
+    // Pull restores the downloaded save over the current local one - destructive,
+    // unlike push (which only takes a backup and uploads). Confirm before overwriting.
+    if (!window.confirm(`Pull "${game}" from the cloud and restore it? This will overwrite your current local save.`)) {
+      return;
+    }
     await syncTransfer(game, "sync_pull");
   }
 
@@ -401,6 +423,9 @@ function SyncScreen({
                     <div className="game-card-actions">
                       <button disabled={busy === game} onClick={() => backup(game)}>
                         Backup
+                      </button>
+                      <button disabled={busy === game} onClick={() => restore(game)}>
+                        Restore
                       </button>
                       <button disabled={busy === game} onClick={() => push(game)}>
                         Push

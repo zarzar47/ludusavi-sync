@@ -73,6 +73,8 @@ struct SyncProgressEvent {
 }
 
 /// Push a single game's local backup to the cloud (additive - never deletes other games).
+/// Takes a fresh local backup first, so the cloud gets the current save rather than
+/// whatever was last backed up.
 #[tauri::command]
 async fn sync_push(
     app: tauri::AppHandle,
@@ -80,7 +82,7 @@ async fn sync_push(
     preview: bool,
     state: tauri::State<'_, AppState>,
 ) -> Result<usize, String> {
-    with_ludusavi(&state, |l| {
+    with_ludusavi_mut(&state, |l| {
         let finality = if preview { Finality::Preview } else { Finality::Final };
         let mut on_progress = |p: SyncProgress| {
             let _ = app.emit(
@@ -98,7 +100,8 @@ async fn sync_push(
     })
 }
 
-/// Pull a single game's backup from the cloud (additive - never deletes local data).
+/// Pull a single game's backup from the cloud (additive), then restore it over the
+/// current local save - destructive locally, by design.
 #[tauri::command]
 async fn sync_pull(
     app: tauri::AppHandle,
@@ -106,7 +109,7 @@ async fn sync_pull(
     preview: bool,
     state: tauri::State<'_, AppState>,
 ) -> Result<usize, String> {
-    with_ludusavi(&state, |l| {
+    with_ludusavi_mut(&state, |l| {
         let finality = if preview { Finality::Preview } else { Finality::Final };
         let mut on_progress = |p: SyncProgress| {
             let _ = app.emit(
@@ -152,9 +155,10 @@ struct WinePrefixCheck {
 }
 
 /// Detects a restore hazard: the latest backup recorded a Wine/Proton prefix, but none
-/// was found locally. A CLI `ludusavi restore` would fail with `WinePrefixNotFound` (or
-/// silently misdirect if `scan.redirect_wine` is off) - there's no in-app restore yet,
-/// so this only warns rather than gating anything.
+/// was found locally. `sync_pull` restores as part of the pull now, so this hitting
+/// `WinePrefixNotFound` (or silently misdirecting if `scan.redirect_wine` is off) is a
+/// real failure mode - useful for the UI to warn about before Pull is even clicked,
+/// though it only warns rather than gating the button itself.
 #[tauri::command]
 async fn wine_prefix_check(game: String, state: tauri::State<'_, AppState>) -> Result<WinePrefixCheck, String> {
     with_ludusavi(&state, |l| {
@@ -332,6 +336,27 @@ async fn backup_game(game: String, state: tauri::State<'_, AppState>) -> Result<
     with_ludusavi_mut(&state, |l| {
         let output = l
             .back_up(parameters::BackUp {
+                games: vec![game.clone()],
+                finality: Finality::Final,
+                ..Default::default()
+            })
+            .map_err(|e| format!("{e:?}"))?;
+
+        Ok(match output.games.get(&game) {
+            Some(ApiGame::Operative { files, registry, .. }) => files.len() + registry.len(),
+            _ => 0,
+        })
+    })
+}
+
+/// Restore one game's latest local backup over its current save - no cloud involved,
+/// just undoing back to what's already sitting in backup storage. Destructive locally,
+/// same as the restore step `sync_pull` runs after downloading.
+#[tauri::command]
+async fn restore_game(game: String, state: tauri::State<'_, AppState>) -> Result<usize, String> {
+    with_ludusavi_mut(&state, |l| {
+        let output = l
+            .restore(parameters::Restore {
                 games: vec![game.clone()],
                 finality: Finality::Final,
                 ..Default::default()
@@ -570,6 +595,7 @@ pub fn run() {
             set_group_ignored,
             set_game_enabled,
             backup_game,
+            restore_game,
             scan_games,
             cancel_scan,
             cloud_status,

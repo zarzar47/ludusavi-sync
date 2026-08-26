@@ -1153,6 +1153,7 @@ pub fn run(sub: Subcommand, no_manifest_update: bool, try_manifest_update: bool)
                 gui,
             } => {
                 let finality = if preview { Finality::Preview } else { Finality::Final };
+                let manifest = load_manifest(&config, &mut cache, no_manifest_update, try_manifest_update)?;
                 let game = resolve_single_game(&config, &mut cache, game, api)?;
 
                 if !ui::confirm(
@@ -1160,13 +1161,13 @@ pub fn run(sub: Subcommand, no_manifest_update: bool, try_manifest_update: bool)
                     gui,
                     force,
                     finality.preview(),
-                    "Push this game's local backup to the cloud? This is additive and will not delete anything on the cloud.",
+                    "Push this game's local backup to the cloud? This takes a fresh local backup first, then uploads it - additive on the cloud, never deletes anything there.",
                 )? {
                     return Ok(());
                 }
 
-                let result =
-                    crate::sync::push_game(&config, &config.backup.path, &config.cloud.path, &game, finality, None)?;
+                let mut ludusavi = ludusavi::api::Ludusavi::new(config.clone(), manifest);
+                let result = ludusavi.sync_push(&game, finality, None)?;
                 report_cloud_changes(&result.changes, api);
             }
             parse::SyncSubcommand::Pull {
@@ -1177,6 +1178,7 @@ pub fn run(sub: Subcommand, no_manifest_update: bool, try_manifest_update: bool)
                 gui,
             } => {
                 let finality = if preview { Finality::Preview } else { Finality::Final };
+                let manifest = load_manifest(&config, &mut cache, no_manifest_update, try_manifest_update)?;
                 let game = resolve_single_game(&config, &mut cache, game, api)?;
 
                 if !ui::confirm(
@@ -1184,13 +1186,13 @@ pub fn run(sub: Subcommand, no_manifest_update: bool, try_manifest_update: bool)
                     gui,
                     force,
                     finality.preview(),
-                    "Pull this game's backup from the cloud? This is additive and will not delete anything locally.",
+                    "Pull this game's backup from the cloud and restore it here? This will overwrite your current local save with the downloaded one.",
                 )? {
                     return Ok(());
                 }
 
-                let result =
-                    crate::sync::pull_game(&config, &config.backup.path, &config.cloud.path, &game, finality, None)?;
+                let mut ludusavi = ludusavi::api::Ludusavi::new(config.clone(), manifest);
+                let result = ludusavi.sync_pull(&game, finality, None)?;
                 report_cloud_changes(&result.changes, api);
             }
             parse::SyncSubcommand::Status { game, api } => {

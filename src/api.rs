@@ -648,8 +648,15 @@ impl Ludusavi {
 
     /// Push a single game's local backup to the cloud.
     /// Additive on the destination - never deletes another game's cloud data.
+    ///
+    /// Takes a fresh local backup of the game first, so the cloud always gets the
+    /// current save rather than whatever was last backed up (possibly stale). That
+    /// inner backup runs with `config.cloud.synchronize` (upstream's bulk mirror-sync
+    /// feature - a different, destructive rclone `sync()`) forced off, so this stays
+    /// purely this fork's additive per-game mechanism even if that upstream toggle
+    /// happens to be on.
     pub fn sync_push(
-        &self,
+        &mut self,
         game: &str,
         finality: Finality,
         on_progress: Option<&mut dyn FnMut(crate::sync::SyncProgress)>,
@@ -657,6 +664,21 @@ impl Ludusavi {
         let Some(game) = self.title_finder.find_one_by_name(game) else {
             return Err(Error::GameIsUnrecognized);
         };
+
+        let original_sync = self.config.cloud.synchronize;
+        self.config.cloud.synchronize = false;
+        let backup_result = self.back_up(parameters::BackUp {
+            games: vec![game.clone()],
+            finality,
+            resolve_cloud_conflict: None,
+            wine_prefix: None,
+            include_disabled: true,
+            skip_downgrade: false,
+            cancel: None,
+        });
+        self.config.cloud.synchronize = original_sync;
+        backup_result?;
+
         crate::sync::push_game(
             &self.config,
             &self.config.backup.path,
@@ -669,8 +691,15 @@ impl Ludusavi {
 
     /// Pull a single game's backup from the cloud.
     /// Additive on the destination - never deletes local data for another game.
+    ///
+    /// Then restores it over the current local save - destructive locally, by design.
+    /// If no valid Wine/Proton prefix can be found on this machine, the restore step
+    /// refuses (`Error::WinePrefixNotFound`) rather than writing to a foreign path; the
+    /// downloaded backup still lands safely in backup storage either way, so nothing is
+    /// lost even if this call returns an error. The restore step runs with
+    /// `config.cloud.synchronize` forced off, same reasoning as `sync_push`.
     pub fn sync_pull(
-        &self,
+        &mut self,
         game: &str,
         finality: Finality,
         on_progress: Option<&mut dyn FnMut(crate::sync::SyncProgress)>,
@@ -678,14 +707,30 @@ impl Ludusavi {
         let Some(game) = self.title_finder.find_one_by_name(game) else {
             return Err(Error::GameIsUnrecognized);
         };
-        crate::sync::pull_game(
+
+        let result = crate::sync::pull_game(
             &self.config,
             &self.config.backup.path,
             &self.config.cloud.path,
             &game,
             finality,
             on_progress,
-        )
+        )?;
+
+        let original_sync = self.config.cloud.synchronize;
+        self.config.cloud.synchronize = false;
+        let restore_result = self.restore(parameters::Restore {
+            games: vec![game.clone()],
+            finality,
+            backup: None,
+            resolve_cloud_conflict: None,
+            include_disabled: true,
+            skip_downgrade: false,
+        });
+        self.config.cloud.synchronize = original_sync;
+        restore_result?;
+
+        Ok(result)
     }
 
     /// Get the last-known cloud sync info for a game, from `settings.config`.
