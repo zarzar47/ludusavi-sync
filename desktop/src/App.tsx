@@ -6,7 +6,7 @@ import { GameSettingsModal } from "./GameSettingsModal";
 import "./App.css";
 
 // Mirrors resource::sync_state::GameSyncEntry.
-interface GameSyncEntry {
+export interface GameSyncEntry {
   last_push: string;
   device: string;
   mapping_path: string;
@@ -29,17 +29,9 @@ interface SyncProgressEvent {
 }
 
 // Live byte progress of a push/pull for one game.
-interface GameProgress {
+export interface GameProgress {
   current: number;
   total: number;
-}
-
-function formatBytes(bytes: number): string {
-  if (!isFinite(bytes) || bytes <= 0) return "0 B";
-  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
-  const exp = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
-  const value = bytes / Math.pow(1024, exp);
-  return `${value.toFixed(value >= 100 || exp === 0 ? 0 : 1)} ${units[exp]}`;
 }
 
 // Coarse "how long ago" for a sync badge tooltip - doesn't need to be precise,
@@ -324,6 +316,67 @@ function SyncScreen({
     }
   }, [rows]);
 
+  function renderCard(game: string) {
+    const enabled = enabledSet.has(game);
+    const scanned = scanResults[game];
+    const cover = covers[game];
+    return (
+      <div
+        className="game-card"
+        key={game}
+        onContextMenu={(e) => {
+          e.preventDefault();
+          setSettingsGame(game);
+        }}
+        onPointerDown={(e) => startLongPress(e, game)}
+        onPointerUp={cancelLongPress}
+        onPointerLeave={cancelLongPress}
+      >
+        <div className="game-card-cover" role="button" title="Game settings" onClick={() => setSettingsGame(game)}>
+          {cover ? (
+            <img src={cover} alt="" loading="lazy" />
+          ) : (
+            <div className="game-card-cover-fallback">{game.charAt(0).toUpperCase()}</div>
+          )}
+          {enabled && (
+            <span
+              className={`sync-badge ${syncBadges[game] ? "sync-badge-synced" : "sync-badge-none"}`}
+              title={
+                syncBadges[game]
+                  ? `synced ${relativeTime(syncBadges[game].last_push)} from ${syncBadges[game].device}`
+                  : "never synced"
+              }
+            />
+          )}
+          <button
+            className="star-button card-star"
+            aria-label={enabled ? "Remove from sync" : "Add to sync"}
+            title={enabled ? "Remove from sync" : "Add to sync"}
+            onClick={(e) => {
+              e.stopPropagation();
+              toggleEnabled(game, !enabled);
+            }}
+          >
+            {enabled ? "★" : "☆"}
+          </button>
+        </div>
+        <div className="game-card-body">
+          <span className="game-name" title={game}>
+            {game}
+          </span>
+          {!enabled && scanned && (
+            <span className="game-status">
+              found: {scanned.file_count} file(s), {scanned.change}
+            </span>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  const starredRows = rows.filter((game) => enabledSet.has(game));
+  const unstarredRows = rows.filter((game) => !enabledSet.has(game));
+
   return (
     <>
       {error && <p className="error-text">{error}</p>}
@@ -358,118 +411,13 @@ function SyncScreen({
         </p>
       )}
 
-      <div className="game-grid">
-        {rows.map((game) => {
-          const enabled = enabledSet.has(game);
-          const entry = statuses[game];
-          const scanned = scanResults[game];
-          const cover = covers[game];
-          const gameProgress = busy === game ? progress[game] : null;
-          const pct =
-            gameProgress && gameProgress.total > 0
-              ? Math.min(100, Math.round((gameProgress.current / gameProgress.total) * 100))
-              : null;
-          return (
-            <div
-              className="game-card"
-              key={game}
-              onContextMenu={(e) => {
-                e.preventDefault();
-                setSettingsGame(game);
-              }}
-              onPointerDown={(e) => startLongPress(e, game)}
-              onPointerUp={cancelLongPress}
-              onPointerLeave={cancelLongPress}
-            >
-              <div
-                className="game-card-cover"
-                role="button"
-                title="Game settings"
-                onClick={() => setSettingsGame(game)}
-              >
-                {cover ? (
-                  <img src={cover} alt="" loading="lazy" />
-                ) : (
-                  <div className="game-card-cover-fallback">{game.charAt(0).toUpperCase()}</div>
-                )}
-                {enabled && (
-                  <span
-                    className={`sync-badge ${syncBadges[game] ? "sync-badge-synced" : "sync-badge-none"}`}
-                    title={
-                      syncBadges[game]
-                        ? `synced ${relativeTime(syncBadges[game].last_push)} from ${syncBadges[game].device}`
-                        : "never synced"
-                    }
-                  />
-                )}
-                <button
-                  className="star-button card-star"
-                  aria-label={enabled ? "Remove from sync" : "Add to sync"}
-                  title={enabled ? "Remove from sync" : "Add to sync"}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    toggleEnabled(game, !enabled);
-                  }}
-                >
-                  {enabled ? "★" : "☆"}
-                </button>
-              </div>
-              <div className="game-card-body">
-                <span className="game-name" title={game}>
-                  {game}
-                </span>
-                {enabled ? (
-                  <>
-                    <div className="game-card-actions">
-                      <button disabled={busy === game} onClick={() => backup(game)}>
-                        Backup
-                      </button>
-                      <button disabled={busy === game} onClick={() => restore(game)}>
-                        Restore
-                      </button>
-                      <button disabled={busy === game} onClick={() => push(game)}>
-                        Push
-                      </button>
-                      <button disabled={busy === game} onClick={() => pull(game)}>
-                        Pull
-                      </button>
-                      <button disabled={busy === game} onClick={() => checkStatus(game)}>
-                        Status
-                      </button>
-                    </div>
-                    {entry !== undefined && (
-                      <span className="game-status">
-                        {entry
-                          ? `last pushed ${entry.last_push} from ${entry.device}`
-                          : "no cloud sync record"}
-                      </span>
-                    )}
-                  </>
-                ) : (
-                  scanned && (
-                    <span className="game-status">
-                      found: {scanned.file_count} file(s), {scanned.change}
-                    </span>
-                  )
-                )}
-                {gameProgress && (
-                  <div className="sync-progress">
-                    <div
-                      className={`sync-progress-fill${pct === null ? " sync-progress-indeterminate" : ""}`}
-                      style={pct === null ? undefined : { width: `${pct}%` }}
-                    />
-                    <span className="sync-progress-label">
-                      {pct === null
-                        ? "syncing…"
-                        : `${pct}% · ${formatBytes(gameProgress.current)} / ${formatBytes(gameProgress.total)}`}
-                    </span>
-                  </div>
-                )}
-              </div>
-            </div>
-          );
-        })}
-      </div>
+      {starredRows.length > 0 && <div className="game-grid">{starredRows.map(renderCard)}</div>}
+
+      {starredRows.length > 0 && unstarredRows.length > 0 && (
+        <div className="grid-divider">Not starred</div>
+      )}
+
+      {unstarredRows.length > 0 && <div className="game-grid">{unstarredRows.map(renderCard)}</div>}
 
       {settingsGame && (
         <GameSettingsModal
@@ -477,6 +425,15 @@ function SyncScreen({
           cover={covers[settingsGame]}
           onCoverChange={(cover) => setCovers((prev) => ({ ...prev, [settingsGame]: cover }))}
           onClose={() => setSettingsGame(null)}
+          enabled={enabledSet.has(settingsGame)}
+          busy={busy === settingsGame}
+          entry={statuses[settingsGame]}
+          progress={busy === settingsGame ? progress[settingsGame] ?? null : null}
+          onBackup={() => backup(settingsGame)}
+          onRestore={() => restore(settingsGame)}
+          onPush={() => push(settingsGame)}
+          onPull={() => pull(settingsGame)}
+          onCheckStatus={() => checkStatus(settingsGame)}
         />
       )}
     </>

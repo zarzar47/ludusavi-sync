@@ -147,6 +147,33 @@ button {
   list-style: none;
 }
 
+.game-grid + .game-grid {
+  margin-top: 1.5em;
+}
+
+/* Centered "Not starred" label with a rule on either side, splitting the starred
+   and unstarred groups - a star toggle visually moves a card across this line. */
+.grid-divider {
+  display: flex;
+  align-items: center;
+  gap: 0.75em;
+  max-width: 960px;
+  margin: 1.5em auto 0;
+  font-size: 0.75em;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  opacity: 0.6;
+}
+
+.grid-divider::before,
+.grid-divider::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background-color: rgba(128, 128, 128, 0.25);
+}
+
 .game-card {
   display: flex;
   flex-direction: column;
@@ -321,6 +348,17 @@ button {
   display: flex;
   flex-direction: column;
   gap: 0.5em;
+}
+
+.modal-sync-section {
+  margin-bottom: 1em;
+  padding-bottom: 1em;
+  border-bottom: 1px solid rgba(128, 128, 128, 0.2);
+}
+
+.modal-actions button {
+  padding: 0.5em 0.6em;
+  font-size: 0.9em;
 }
 
 .modal-saves-header {

@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
+import type { GameProgress, GameSyncEntry } from "./App";
 
 // Mirrors src-tauri's ScanEntry.
 interface ScanEntry {
@@ -34,6 +35,14 @@ function parentDir(path: string): string {
   return parts.slice(0, -1).join("/") || "/";
 }
 
+function formatBytes(bytes: number): string {
+  if (!isFinite(bytes) || bytes <= 0) return "0 B";
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+  const exp = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+  const value = bytes / Math.pow(1024, exp);
+  return `${value.toFixed(value >= 100 || exp === 0 ? 0 : 1)} ${units[exp]}`;
+}
+
 // Opened by right-click or long-press on a game card (App.tsx). Shows the game's
 // cover art (with a picker to override it) and the save files/registry entries a
 // scan found for it, each with a checkbox to include/exclude from backup - the same
@@ -46,11 +55,34 @@ export function GameSettingsModal({
   cover,
   onCoverChange,
   onClose,
+  enabled,
+  busy,
+  entry,
+  progress,
+  onBackup,
+  onRestore,
+  onPush,
+  onPull,
+  onCheckStatus,
 }: {
   game: string;
   cover: string | null | undefined;
   onCoverChange: (cover: string | null) => void;
   onClose: () => void;
+  // Whether this game is starred/tracked - only tracked games have sync actions.
+  enabled: boolean;
+  // True while a backup/restore/push/pull is running for this game.
+  busy: boolean;
+  // Cloud sync record, from the last "Status" check (or a push/pull). `undefined`
+  // means "haven't checked yet"; `null` means "checked, no record".
+  entry: GameSyncEntry | null | undefined;
+  // Live byte progress while a push/pull is in flight, else null.
+  progress: GameProgress | null;
+  onBackup: () => void;
+  onRestore: () => void;
+  onPush: () => void;
+  onPull: () => void;
+  onCheckStatus: () => void;
 }) {
   const [entries, setEntries] = useState<ScanEntry[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -207,6 +239,56 @@ export function GameSettingsModal({
             </button>
           </div>
         </div>
+
+        {enabled ? (
+          <div className="modal-sync-section">
+            <div className="game-card-actions modal-actions">
+              <button disabled={busy} onClick={onBackup}>
+                Backup
+              </button>
+              <button disabled={busy} onClick={onRestore}>
+                Restore
+              </button>
+              <button disabled={busy} onClick={onPush}>
+                Push
+              </button>
+              <button disabled={busy} onClick={onPull}>
+                Pull
+              </button>
+              <button disabled={busy} onClick={onCheckStatus}>
+                Status
+              </button>
+            </div>
+            {entry !== undefined && (
+              <span className="game-status">
+                {entry ? `last pushed ${entry.last_push} from ${entry.device}` : "no cloud sync record"}
+              </span>
+            )}
+            {progress && (
+              <div className="sync-progress">
+                <div
+                  className={`sync-progress-fill${
+                    progress.total > 0 ? "" : " sync-progress-indeterminate"
+                  }`}
+                  style={
+                    progress.total > 0
+                      ? { width: `${Math.min(100, Math.round((progress.current / progress.total) * 100))}%` }
+                      : undefined
+                  }
+                />
+                <span className="sync-progress-label">
+                  {progress.total > 0
+                    ? `${Math.min(100, Math.round((progress.current / progress.total) * 100))}% · ${formatBytes(
+                        progress.current,
+                      )} / ${formatBytes(progress.total)}`
+                    : "syncing…"}
+                </span>
+              </div>
+            )}
+          </div>
+        ) : (
+          <p className="game-status">Star this game (☆ on its card) to enable backup and sync actions.</p>
+        )}
 
         <div className="modal-saves-header">
           <h3>
