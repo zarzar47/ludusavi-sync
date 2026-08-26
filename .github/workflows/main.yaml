@@ -9,24 +9,9 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: windows-latest
-            rust-target: x86_64-pc-windows-msvc
-            artifact-name: win64
-            artifact-file: ludusavi.exe
-            tar: false
-          - os: windows-latest
-            rust-target: i686-pc-windows-msvc
-            artifact-name: win32
-            artifact-file: ludusavi.exe
-            tar: false
           - os: ubuntu-22.04
             rust-target: x86_64-unknown-linux-gnu
             artifact-name: linux
-            artifact-file: ludusavi
-            tar: true
-          - os: macos-14
-            rust-target: aarch64-apple-darwin
-            artifact-name: mac
             artifact-file: ludusavi
             tar: true
     runs-on: ${{ matrix.os }}
