@@ -113,6 +113,17 @@ export function GameSettingsModal({
     return () => document.removeEventListener("keydown", onKeyDown);
   }, [onClose]);
 
+  // The overlay being position:fixed blocks clicks on whatever's behind it, but
+  // does nothing to stop wheel/trackpad scroll from moving the page underneath -
+  // lock body scroll for as long as the modal is mounted, restore on close.
+  useEffect(() => {
+    const previous = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      document.body.style.overflow = previous;
+    };
+  }, []);
+
   async function changeCover() {
     const picked = await open({
       multiple: false,
