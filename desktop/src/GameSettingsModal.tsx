@@ -281,7 +281,7 @@ export function GameSettingsModal({
                     ? `${Math.min(100, Math.round((progress.current / progress.total) * 100))}% · ${formatBytes(
                         progress.current,
                       )} / ${formatBytes(progress.total)}`
-                    : "syncing…"}
+                    : "working…"}
                 </span>
               </div>
             )}

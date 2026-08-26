@@ -221,15 +221,21 @@ function SyncScreen({
     }
   }
 
+  // Backup/restore have no per-file progress hook from the backend (unlike
+  // push/pull, which stream rclone's own byte progress) - `total: 0` renders
+  // the modal's indeterminate bar, so there's at least a "still working" cue
+  // instead of the button just hanging with no feedback.
   async function backup(game: string) {
     setBusy(game);
     setError(null);
+    setProgress((prev) => ({ ...prev, [game]: { current: 0, total: 0 } }));
     try {
       await invoke<number>("backup_game", { game });
     } catch (e) {
       setError(String(e));
     } finally {
       setBusy(null);
+      setProgress((prev) => ({ ...prev, [game]: null }));
     }
   }
 
@@ -241,12 +247,14 @@ function SyncScreen({
     }
     setBusy(game);
     setError(null);
+    setProgress((prev) => ({ ...prev, [game]: { current: 0, total: 0 } }));
     try {
       await invoke<number>("restore_game", { game });
     } catch (e) {
       setError(String(e));
     } finally {
       setBusy(null);
+      setProgress((prev) => ({ ...prev, [game]: null }));
     }
   }
 
