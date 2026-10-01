@@ -261,6 +261,44 @@ button {
   background-color: rgba(128, 128, 128, 0.5);
 }
 
+/* Task state sits opposite the sync badge: a spinner while an operation runs, then how
+   it ended. Kept visible after the modal is closed, so a failure isn't lost. */
+.task-badge {
+  position: absolute;
+  top: 0.3em;
+  right: 0.3em;
+  min-width: 1.5em;
+  height: 1.5em;
+  padding: 0 0.25em;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 0.75em;
+  font-size: 0.75em;
+  font-weight: 700;
+  color: #ffffff;
+  border: 1.5px solid rgba(15, 15, 15, 0.55);
+  background-color: rgba(128, 128, 128, 0.85);
+}
+
+.task-badge-info {
+  background-color: #3fb950;
+}
+
+.task-badge-warn {
+  background-color: #b8860b;
+}
+
+.task-badge-error {
+  background-color: #d33;
+}
+
+.spinner-small {
+  width: 1em;
+  height: 1em;
+  border-width: 2px;
+}
+
 .game-card-body {
   display: flex;
   flex-direction: column;
@@ -457,10 +495,17 @@ button {
   list-style: none;
   padding: 0;
   margin: 0;
+  /* Keep space on the right so inline action buttons aren't covered by the scrollbar */
+  padding-right: 1.6em;
+  box-sizing: border-box;
 }
 
 .entry-row {
   border-top: 1px solid rgba(128, 128, 128, 0.15);
+  display: flex;
+  align-items: center;
+  /* small buffer so the row's contents don't butt directly into the scroll gutter */
+  padding-right: 0.4em;
 }
 
 .entry-row label {
@@ -470,6 +515,23 @@ button {
   padding: 0.4em 0.7em 0.4em 2.1em;
   cursor: pointer;
   font-size: 0.85em;
+  flex: 1;
+}
+
+.open-entry-button {
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  padding: 0.15em 0.25em;
+  margin-right: 0.6em;
+  font-size: 0.9em;
+  line-height: 1;
+  cursor: pointer;
+  color: inherit;
+}
+
+.open-entry-button:hover {
+  color: #396cd8;
 }
 
 .entry-row input[type="checkbox"] {
@@ -524,11 +586,71 @@ button {
   }
 }
 
-.sync-progress-label {
-  display: block;
-  margin-top: 0.2em;
-  font-size: 0.8em;
+.task-status {
+  margin-top: 0.4em;
+}
+
+.task-status-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1em;
+}
+
+.task-status-label {
+  font-size: 0.85em;
+}
+
+.task-status-percent {
+  font-size: 0.85em;
   opacity: 0.75;
+}
+
+.cancel-button {
+  background-color: #d33;
+  color: #ffffff;
+}
+
+.task-log {
+  margin-top: 0.5em;
+  max-height: 30vh;
+  overflow-y: auto;
+  padding: 0.5em 0.6em;
+  border-radius: 6px;
+  border: 1px solid rgba(128, 128, 128, 0.25);
+  background-color: rgba(128, 128, 128, 0.12);
+  font-size: 0.8em;
+  line-height: 1.45;
+}
+
+.task-log-empty {
+  margin: 0;
+  opacity: 0.6;
+}
+
+.task-log-line {
+  display: flex;
+  gap: 0.6em;
+  padding: 0.1em 0;
+}
+
+.task-log-time {
+  flex: 0 0 auto;
+  opacity: 0.55;
+  font-variant-numeric: tabular-nums;
+}
+
+.task-log-message {
+  flex: 1;
+  overflow-wrap: anywhere;
+}
+
+.task-log-warn .task-log-message {
+  color: #b8860b;
+}
+
+.task-log-error .task-log-message {
+  color: #d33;
 }
 
 .cloud-settings {
@@ -645,5 +767,17 @@ button {
   .modal-panel {
     background-color: #2f2f2f;
     color: #f6f6f6;
+  }
+
+  .task-log {
+    background-color: #0f0f0f69;
+  }
+
+  .task-log-warn .task-log-message {
+    color: #e3b341;
+  }
+
+  .task-log-error .task-log-message {
+    color: #f4707a;
   }
 }

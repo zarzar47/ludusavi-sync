@@ -1,7 +1,15 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
-import type { GameProgress, GameSyncEntry } from "./App";
+import type { GameSyncEntry } from "./App";
+import {
+  PHASE_LABELS,
+  TASK_LABELS,
+  clockTime,
+  formatBytes,
+  type RunningTask,
+  type TaskLogLine,
+} from "./tasks";
 
 // Mirrors src-tauri's ScanEntry.
 interface ScanEntry {
@@ -35,14 +43,6 @@ function parentDir(path: string): string {
   return parts.slice(0, -1).join("/") || "/";
 }
 
-function formatBytes(bytes: number): string {
-  if (!isFinite(bytes) || bytes <= 0) return "0 B";
-  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
-  const exp = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
-  const value = bytes / Math.pow(1024, exp);
-  return `${value.toFixed(value >= 100 || exp === 0 ? 0 : 1)} ${units[exp]}`;
-}
-
 // Opened by right-click or long-press on a game card (App.tsx). Shows the game's
 // cover art (with a picker to override it) and the save files/registry entries a
 // scan found for it, each with a checkbox to include/exclude from backup - the same
@@ -56,13 +56,14 @@ export function GameSettingsModal({
   onCoverChange,
   onClose,
   enabled,
-  busy,
+  task,
   entry,
-  progress,
+  log,
   onBackup,
   onRestore,
   onPush,
   onPull,
+  onCancel,
   onCheckStatus,
 }: {
   game: string;
@@ -71,25 +72,44 @@ export function GameSettingsModal({
   onClose: () => void;
   // Whether this game is starred/tracked - only tracked games have sync actions.
   enabled: boolean;
-  // True while a backup/restore/push/pull is running for this game.
-  busy: boolean;
+  // The backup/restore/push/pull running for this game, else null. While set, the modal
+  // refuses to close: a task has no owner once its modal is gone, so there'd be no way
+  // to see its progress, cancel it, or read what it reported.
+  task: RunningTask | null;
   // Cloud sync record, from the last "Status" check (or a push/pull). `undefined`
   // means "haven't checked yet"; `null` means "checked, no record".
   entry: GameSyncEntry | null | undefined;
-  // Live byte progress while a push/pull is in flight, else null.
-  progress: GameProgress | null;
+  // This game's task log: what the user pressed, what the core reported while working,
+  // and how it ended. Empty until the first task runs, and kept afterwards.
+  log: TaskLogLine[];
   onBackup: () => void;
   onRestore: () => void;
   onPush: () => void;
   onPull: () => void;
+  // Ask the backend to stop the running task. Cooperative: rclone is killed, file
+  // copying stops at the next file boundary.
+  onCancel: () => void;
   onCheckStatus: () => void;
 }) {
   const [entries, setEntries] = useState<ScanEntry[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [coverBusy, setCoverBusy] = useState(false);
-  const [filter, setFilter] = useState("");
+  // Filter removed: keep file list unfiltered and show all entries
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const [wineCheck, setWineCheck] = useState<WinePrefixCheck | null>(null);
+  const [cancelling, setCancelling] = useState(false);
+  const logRef = useRef<HTMLDivElement>(null);
+
+  // A running task owns this modal: closing it (✕, the overlay, Escape) would hide the
+  // only progress, cancel, and result view for an operation that's still going.
+  const busy = task !== null;
+
+  // Follow the tail of the log as lines arrive, the way a terminal does - otherwise the
+  // newest line (the error you need) sits below the fold.
+  useLayoutEffect(() => {
+    const el = logRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [log]);
 
   useEffect(() => {
     invoke<ScanEntry[]>("game_scan_entries", { game })
@@ -107,11 +127,11 @@ export function GameSettingsModal({
 
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
-      if (e.key === "Escape") onClose();
+      if (e.key === "Escape" && !busy) onClose();
     }
     document.addEventListener("keydown", onKeyDown);
     return () => document.removeEventListener("keydown", onKeyDown);
-  }, [onClose]);
+  }, [busy, onClose]);
 
   // The overlay being position:fixed blocks clicks on whatever's behind it, but
   // does nothing to stop wheel/trackpad scroll from moving the page underneath -
@@ -154,6 +174,14 @@ export function GameSettingsModal({
     } finally {
       setCoverBusy(false);
     }
+  }
+
+  // "Stopping…" is sticky on purpose: cancellation is cooperative (rclone gets killed,
+  // file copies stop at the next boundary), so the button stays disabled until the task
+  // itself actually reports back and the modal leaves its busy state.
+  function cancel() {
+    setCancelling(true);
+    onCancel();
   }
 
   async function toggleEntry(entry: ScanEntry) {
@@ -200,25 +228,29 @@ export function GameSettingsModal({
 
   const groups = useMemo(() => {
     if (!entries) return [];
-    const needle = filter.trim().toLowerCase();
-    const filtered = needle ? entries.filter((e) => e.path.toLowerCase().includes(needle)) : entries;
     const byDir = new Map<string, ScanEntry[]>();
-    for (const entry of filtered) {
+    for (const entry of entries) {
       const dir = parentDir(entry.path);
       byDir.set(dir, [...(byDir.get(dir) ?? []), entry]);
     }
     return [...byDir.entries()].sort(([a], [b]) => a.localeCompare(b));
-  }, [entries, filter]);
+  }, [entries]);
 
   const totalCount = entries?.length ?? 0;
   const shownCount = groups.reduce((sum, [, list]) => sum + list.length, 0);
 
   return (
-    <div className="modal-overlay" onClick={onClose}>
+    <div className="modal-overlay" onClick={() => !busy && onClose()}>
       <div className="modal-panel" onClick={(e) => e.stopPropagation()}>
         <div className="modal-header">
           <h2 title={game}>{game}</h2>
-          <button className="icon-button modal-close" aria-label="Close" title="Close" onClick={onClose}>
+          <button
+            className="icon-button modal-close"
+            aria-label="Close"
+            title={busy ? "Cancel or wait for the running operation before closing" : "Close"}
+            disabled={busy}
+            onClick={onClose}
+          >
             ✕
           </button>
         </div>
@@ -269,55 +301,46 @@ export function GameSettingsModal({
               <button disabled={busy} onClick={onCheckStatus}>
                 Status
               </button>
+              {busy && (
+                <button className="cancel-button" disabled={cancelling} onClick={cancel} title="Stop the running operation">
+                  {cancelling ? "Stopping…" : "Cancel"}
+                </button>
+              )}
             </div>
             {entry !== undefined && (
               <span className="game-status">
                 {entry ? `last pushed ${entry.last_push} from ${entry.device}` : "no cloud sync record"}
               </span>
             )}
-            {progress && (
-              <div className="sync-progress">
-                <div
-                  className={`sync-progress-fill${
-                    progress.total > 0 ? "" : " sync-progress-indeterminate"
-                  }`}
-                  style={
-                    progress.total > 0
-                      ? { width: `${Math.min(100, Math.round((progress.current / progress.total) * 100))}%` }
-                      : undefined
-                  }
-                />
-                <span className="sync-progress-label">
-                  {progress.total > 0
-                    ? `${Math.min(100, Math.round((progress.current / progress.total) * 100))}% · ${formatBytes(
-                        progress.current,
-                      )} / ${formatBytes(progress.total)}`
-                    : "working…"}
-                </span>
-              </div>
-            )}
+            {task && <TaskStatus task={task} />}
           </div>
         ) : (
           <p className="game-status">Star this game (☆ on its card) to enable backup and sync actions.</p>
         )}
 
+        <div className="task-log" ref={logRef}>
+          {log.length === 0 ? (
+            <p className="task-log-empty">No activity yet - run Backup, Restore, Push, or Pull.</p>
+          ) : (
+            log.map((line, index) => (
+              <div className={`task-log-line task-log-${line.level}`} key={index}>
+                <span className="task-log-time">{clockTime(line.at)}</span>
+                <span className="task-log-message">{line.message}</span>
+              </div>
+            ))
+          )}
+        </div>
+
         <div className="modal-saves-header">
           <h3>
             Saves found{totalCount > 0 && ` (${shownCount === totalCount ? totalCount : `${shownCount}/${totalCount}`})`}
           </h3>
-          {totalCount > 8 && (
-            <input
-              className="search-field entry-filter"
-              value={filter}
-              onChange={(e) => setFilter(e.currentTarget.value)}
-              placeholder="Filter by path…"
-            />
-          )}
+          {/* "Filter by path" removed per user request */}
         </div>
 
         {entries === null && <p>Scanning…</p>}
         {entries !== null && totalCount === 0 && <p>No save files found for this game.</p>}
-        {entries !== null && totalCount > 0 && groups.length === 0 && <p>No files match "{filter}".</p>}
+        {entries !== null && totalCount > 0 && groups.length === 0 && <p>No files found.</p>}
 
         {groups.length > 0 && (
           <div className="entry-groups">
@@ -356,6 +379,16 @@ export function GameSettingsModal({
                               {entry.path.split(/[\\/]/).filter(Boolean).pop()}
                             </span>
                           </label>
+                          <button
+                            className="open-entry-button"
+                            title="Open containing folder"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              invoke("open_in_file_manager", { path: entry.path }).catch((err) => setError(String(err)));
+                            }}
+                          >
+                            ↗
+                          </button>
                         </li>
                       ))}
                     </ul>
@@ -366,6 +399,34 @@ export function GameSettingsModal({
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+// What the running task is doing right now: which step (a push is two, a pull three),
+// and - for the cloud transfer only - rclone's own byte progress. Backup/restore have no
+// per-file hook, so their bar is indeterminate.
+function TaskStatus({ task }: { task: RunningTask }) {
+  const progress = task.progress;
+  const percent = progress && progress.total > 0 ? Math.min(100, Math.round((progress.current / progress.total) * 100)) : null;
+  const label = task.phase ? PHASE_LABELS[task.phase] : `${TASK_LABELS[task.kind]} running`;
+  return (
+    <div className="task-status">
+      <div className="task-status-row">
+        <span className="task-status-label">{label}…</span>
+        {percent !== null && <span className="task-status-percent">{percent}%</span>}
+      </div>
+      <div className={`sync-progress${percent === null ? " sync-progress-indeterminate" : ""}`}>
+        <div
+          className="sync-progress-fill"
+          style={percent === null ? undefined : { width: `${percent}%` }}
+        />
+      </div>
+      {progress && percent !== null && (
+        <span className="game-status">
+          {formatBytes(progress.current)} / {formatBytes(progress.total)}
+        </span>
+      )}
     </div>
   );
 }

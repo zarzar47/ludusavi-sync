@@ -1,8 +1,24 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { CloudSettings } from "./CloudSettings";
 import { GameSettingsModal } from "./GameSettingsModal";
+import {
+  TASK_LABELS,
+  appendCapped,
+  logLine,
+  outcomeLines,
+  outcomeResult,
+  type RunningTask,
+  type TaskKind,
+  type TaskLogEvent,
+  type TaskLogLine,
+  type TaskOutcome,
+  type TaskPhase,
+  type TaskPhaseEvent,
+  type TaskProgressEvent,
+  type TaskResult,
+} from "./tasks";
 import "./App.css";
 
 // Mirrors resource::sync_state::GameSyncEntry.
@@ -21,19 +37,6 @@ interface ScanResult {
   change: string;
 }
 
-// Mirrors src-tauri's SyncProgressEvent.
-interface SyncProgressEvent {
-  game: string;
-  current: number;
-  total: number;
-}
-
-// Live byte progress of a push/pull for one game.
-export interface GameProgress {
-  current: number;
-  total: number;
-}
-
 // Coarse "how long ago" for a sync badge tooltip - doesn't need to be precise,
 // just enough to tell "just synced" from "ages ago" at a glance.
 function relativeTime(iso: string): string {
@@ -44,6 +47,12 @@ function relativeTime(iso: string): string {
 }
 
 type Page = "sync" | "settings";
+
+// Drop a key from a per-game record without mutating it.
+function omit<T>(record: Record<string, T>, key: string): Record<string, T> {
+  const { [key]: _removed, ...rest } = record;
+  return rest;
+}
 
 function App() {
   const [page, setPage] = useState<Page>("sync");
@@ -87,6 +96,9 @@ function SyncScreen({
   onScanningChange: (scanning: boolean) => void;
 }) {
   const [enabledGames, setEnabledGames] = useState<string[]>([]);
+  // Mirror of `enabledGames` for async continuations, which would otherwise read the
+  // value from the render that started the task rather than the current one.
+  const enabledRef = useRef<string[]>([]);
   const [query, setQuery] = useState("");
   const [searchResults, setSearchResults] = useState<string[]>([]);
   const [scanResults, setScanResults] = useState<Record<string, ScanResult>>({});
@@ -94,9 +106,20 @@ function SyncScreen({
   // Passive, always-visible sync badge per starred card - separate from `statuses`
   // (which is only populated on-demand by the "Status" button/a push/pull).
   const [syncBadges, setSyncBadges] = useState<Record<string, GameSyncEntry>>({});
-  const [busy, setBusy] = useState<string | null>(null);
+  // The task (backup/restore/push/pull) currently running for each game. The backend
+  // allows only one at a time, so there is at most one entry - keyed by game anyway, so
+  // every event it streams needs no "is this still mine?" check.
+  const [running, setRunning] = useState<Record<string, RunningTask>>({});
+  // The same map, readable synchronously. `running` is what renders; this is what guards,
+  // so a second click in the same tick can't slip past the one-task-at-a-time check.
+  const runningRef = useRef<Record<string, RunningTask>>({});
+  // Task log per game, kept after the task ends so the modal still shows what happened.
+  // Seeded when a task starts and appended to by the backend's `task-log` events, which
+  // can land before the invoke resolves - hence a separate store from `running`.
+  const [logs, setLogs] = useState<Record<string, TaskLogLine[]>>({});
+  // How the last task for each game ended, for the card badge.
+  const [results, setResults] = useState<Record<string, TaskResult>>({});
   const [error, setError] = useState<string | null>(null);
-  const [progress, setProgress] = useState<Record<string, GameProgress | null>>({});
   // Low-res Steam-style cover art per game, `data:` URIs from the backend.
   // `null` means "asked, Steam has none" - distinct from "haven't asked yet" (absent
   // key), so `coverRequested` below is the source of truth for what's in flight.
@@ -142,6 +165,48 @@ function SyncScreen({
       .catch((e) => setError(String(e)));
   }
 
+  // Task events from the backend, for whichever game's task is running. Registered once
+  // and never torn down: they are tagged with the game, and a late event for a task that
+  // already finished is simply appended to that game's log.
+  useEffect(() => {
+    const subscriptions = [
+      listen<TaskPhaseEvent>("task-phase", ({ payload }) => {
+        setRunning((prev) => {
+          const task = prev[payload.game];
+          if (!task) return prev;
+          return { ...prev, [payload.game]: { ...task, phase: payload.phase as TaskPhase } };
+        });
+      }),
+      listen<TaskProgressEvent>("task-progress", ({ payload }) => {
+        setRunning((prev) => {
+          const task = prev[payload.game];
+          if (!task) return prev;
+          return {
+            ...prev,
+            [payload.game]: { ...task, progress: { current: payload.current, total: payload.total } },
+          };
+        });
+      }),
+      listen<TaskLogEvent>("task-log", ({ payload }) => {
+        setLogs((prev) => ({
+          ...prev,
+          [payload.game]: appendCapped(prev[payload.game] ?? [], [logLine(payload.level, payload.message)]),
+        }));
+      }),
+    ];
+    // Each `listen` resolves asynchronously; by cleanup time they're all registered.
+    let disposed = false;
+    const unlisteners: UnlistenFn[] = [];
+    subscriptions.forEach((subscription) => subscription.then((unlisten) => {
+      if (disposed) unlisten();
+      else unlisteners.push(unlisten);
+    }));
+    return () => {
+      disposed = true;
+      unlisteners.forEach((unlisten) => unlisten());
+    };
+  }, []);
+
   // Only the starred games persist across restarts. Scan results are a snapshot
   // of what was on disk when you pressed Scan and deliberately aren't kept - so a
   // game whose saves you since deleted drops off the next launch instead of
@@ -153,6 +218,7 @@ function SyncScreen({
 
   // Re-fetch badges whenever the starred set changes (mount, star/unstar).
   useEffect(() => {
+    enabledRef.current = enabledGames;
     refreshSyncBadges(enabledGames);
   }, [enabledGames]);
 
@@ -215,77 +281,91 @@ function SyncScreen({
     }
   }
 
-  // Backup/restore have no per-file progress hook from the backend (unlike
-  // push/pull, which stream rclone's own byte progress) - `total: 0` renders
-  // the modal's indeterminate bar, so there's at least a "still working" cue
-  // instead of the button just hanging with no feedback.
-  async function backup(game: string) {
-    setBusy(game);
-    setError(null);
-    setProgress((prev) => ({ ...prev, [game]: { current: 0, total: 0 } }));
-    try {
-      await invoke<number>("backup_game", { game });
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setBusy(null);
-      setProgress((prev) => ({ ...prev, [game]: null }));
-    }
-  }
-
-  async function restore(game: string) {
-    // Restores the latest local backup over the current save - no cloud involved,
-    // just undoing back to what's already in backup storage. Destructive, confirm first.
-    if (!window.confirm(`Restore "${game}" from its latest local backup? This will overwrite your current local save.`)) {
+  // One entry point for all four operations: start the task, stream whatever the
+  // backend emits into this game's log, then record the verdict.
+  //
+  // Progress/phase/log events arrive through the listeners registered once on mount -
+  // they carry the game name, so there's nothing to attach and detach per invocation,
+  // and a line emitted while the invoke is still settling isn't lost.
+  async function runTask(game: string, kind: TaskKind, command: string) {
+    // Guard on a ref, not `running`: two clicks in the same tick both see the same
+    // rendered state, so a state-based check lets both through. The backend would refuse
+    // the second, but its `finally` would then clear the *first* task's entry and unlock
+    // the modal while the real task is still running.
+    if (Object.keys(runningRef.current).length > 0) {
+      setError("Another operation is still running. Wait for it to finish, or cancel it.");
       return;
     }
-    setBusy(game);
     setError(null);
-    setProgress((prev) => ({ ...prev, [game]: { current: 0, total: 0 } }));
+    setResults((prev) => omit(prev, game));
+    setLogs((prev) => ({ ...prev, [game]: [logLine("info", `${TASK_LABELS[kind]} started.`)] }));
+    runningRef.current = { ...runningRef.current, [game]: { kind, phase: null, progress: null } };
+    setRunning(runningRef.current);
     try {
-      await invoke<number>("restore_game", { game });
+      const outcome = await invoke<TaskOutcome>(command, { game });
+      appendLines(game, outcomeLines(kind, outcome));
+      setResults((prev) => ({ ...prev, [game]: outcomeResult(kind, outcome) }));
+      // A push writes `settings.config`'s last_push record; a pull may have restored, so
+      // the badge on the card is stale either way. Read the starred list from a ref: the
+      // user may have starred or unstarred games while the task ran.
+      if (kind === "push" || kind === "pull") {
+        await checkStatus(game);
+        refreshSyncBadges(enabledRef.current);
+      }
     } catch (e) {
-      setError(String(e));
+      const message = String(e);
+      appendLines(game, [logLine("error", message)]);
+      setResults((prev) => ({ ...prev, [game]: { kind, level: "error", summary: message } }));
     } finally {
-      setBusy(null);
-      setProgress((prev) => ({ ...prev, [game]: null }));
+      runningRef.current = omit(runningRef.current, game);
+      setRunning(runningRef.current);
     }
   }
 
-  // Run a push or pull, streaming the backend's "sync-progress" events into the
-  // matching game's bar. The event listener is torn down when the invoke settles.
-  async function syncTransfer(game: string, op: "sync_push" | "sync_pull") {
-    setBusy(game);
-    setError(null);
-    setProgress((prev) => ({ ...prev, [game]: { current: 0, total: 0 } }));
-    const unlisten = await listen<SyncProgressEvent>("sync-progress", (e) => {
-      if (e.payload.game !== game) return;
-      setProgress((prev) => ({ ...prev, [game]: { current: e.payload.current, total: e.payload.total } }));
-    });
+  function appendLines(game: string, lines: TaskLogLine[]) {
+    if (lines.length === 0) return;
+    setLogs((prev) => ({ ...prev, [game]: appendCapped(prev[game] ?? [], lines) }));
+  }
+
+  async function cancelTask(game: string) {
     try {
-      await invoke<number>(op, { game, preview: false });
-      await checkStatus(game);
-      refreshSyncBadges(enabledGames);
+      await invoke("task_cancel");
+      appendLines(game, [logLine("warn", "Cancelling...")]);
     } catch (e) {
-      setError(String(e));
-    } finally {
-      unlisten();
-      setBusy(null);
-      setProgress((prev) => ({ ...prev, [game]: null }));
+      appendLines(game, [logLine("error", String(e))]);
     }
   }
 
-  async function push(game: string) {
-    await syncTransfer(game, "sync_push");
+  function backup(game: string) {
+    return runTask(game, "backup", "backup_game");
   }
 
-  async function pull(game: string) {
-    // Pull restores the downloaded save over the current local one - destructive,
-    // unlike push (which only takes a backup and uploads). Confirm before overwriting.
-    if (!window.confirm(`Pull "${game}" from the cloud and restore it? This will overwrite your current local save.`)) {
+  // Restores the latest local backup over the current save - no cloud involved,
+  // just undoing back to what's already in backup storage. Destructive, confirm first.
+  function restore(game: string) {
+    if (
+      !window.confirm(`Restore "${game}" from its latest local backup? This will overwrite your current local save.`)
+    ) {
       return;
     }
-    await syncTransfer(game, "sync_pull");
+    return runTask(game, "restore", "restore_game");
+  }
+
+  function push(game: string) {
+    return runTask(game, "push", "sync_push");
+  }
+
+  // Pull restores the downloaded save over the current local one - destructive, unlike
+  // push (which only takes a backup and uploads). Confirm before overwriting.
+  function pull(game: string) {
+    if (
+      !window.confirm(
+        `Pull "${game}" from the cloud and restore it? This will overwrite your current local save.`,
+      )
+    ) {
+      return;
+    }
+    return runTask(game, "pull", "sync_pull");
   }
 
   // One unified, deduplicated list: everything enabled (starred), plus whatever
@@ -345,6 +425,7 @@ function SyncScreen({
               }
             />
           )}
+          {renderTaskBadge(game, running[game], results[game])}
           <button
             className="star-button card-star"
             aria-label={enabled ? "Remove from sync" : "Add to sync"}
@@ -368,6 +449,33 @@ function SyncScreen({
           )}
         </div>
       </div>
+    );
+  }
+
+  // A running task takes over the badge (the log itself is only in the modal, which is
+  // closed for most of the session); once it finishes the badge keeps the verdict, so a
+  // failure isn't lost when the modal is closed.
+  function renderTaskBadge(game: string, task: RunningTask | undefined, result: TaskResult | undefined) {
+    if (task) {
+      return (
+        <span className="task-badge task-badge-running" title={`${TASK_LABELS[task.kind]} running - open for details`}>
+          <span className="spinner spinner-small" />
+        </span>
+      );
+    }
+    if (!result) return null;
+    const glyph = { info: "✓", warn: "!", error: "✕" }[result.level];
+    return (
+      <span
+        className={`task-badge task-badge-${result.level}`}
+        title={result.summary}
+        onClick={(e) => {
+          e.stopPropagation();
+          setSettingsGame(game);
+        }}
+      >
+        {glyph}
+      </span>
     );
   }
 
@@ -423,13 +531,14 @@ function SyncScreen({
           onCoverChange={(cover) => setCovers((prev) => ({ ...prev, [settingsGame]: cover }))}
           onClose={() => setSettingsGame(null)}
           enabled={enabledSet.has(settingsGame)}
-          busy={busy === settingsGame}
+          task={running[settingsGame] ?? null}
           entry={statuses[settingsGame]}
-          progress={busy === settingsGame ? progress[settingsGame] ?? null : null}
+          log={logs[settingsGame] ?? []}
           onBackup={() => backup(settingsGame)}
           onRestore={() => restore(settingsGame)}
           onPush={() => push(settingsGame)}
           onPull={() => pull(settingsGame)}
+          onCancel={() => cancelTask(settingsGame)}
           onCheckStatus={() => checkStatus(settingsGame)}
         />
       )}
