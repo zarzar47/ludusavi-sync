@@ -400,8 +400,7 @@ async fn scan_games(state: tauri::State<'_, AppState>) -> Result<Vec<ScanResult>
         .map_err(|e| format!("{e:?}"))
     })?;
 
-    // Cancelled: the partial preview is meaningless, and we must not persist a
-    // half-scanned library as the discovered set. Return nothing; the UI has
+    // Cancelled: the partial preview is meaningless. Return nothing; the UI has
     // already torn down the spinner.
     if cancel.is_cancelled() {
         return Ok(vec![]);
@@ -427,13 +426,11 @@ async fn scan_games(state: tauri::State<'_, AppState>) -> Result<Vec<ScanResult>
         .collect();
     results.sort_by(|a, b| a.name.cmp(&b.name));
 
-    // Persist the discovered names so a restart doesn't require re-scanning.
-    // A successful full scan replaces the set, pruning games no longer installed.
-    with_ludusavi_mut(&state, |l| {
-        l.set_discovered_games(results.iter().map(|r| r.name.clone()));
-        Ok(())
-    })?;
-
+    // Results are deliberately NOT persisted. A scan is a snapshot of what's on
+    // disk right now; holding it across restarts would keep showing games whose
+    // saves are long gone. Only the starred set (`sync.enabled_games`) survives a
+    // restart, and each starred game's own file list is rescanned on demand by
+    // `game_scan_entries` when its modal opens.
     Ok(results)
 }
 
@@ -443,13 +440,6 @@ async fn scan_games(state: tauri::State<'_, AppState>) -> Result<Vec<ScanResult>
 async fn cancel_scan(state: tauri::State<'_, AppState>) -> Result<(), String> {
     state.scan_cancel.store(true, Ordering::Relaxed);
     Ok(())
-}
-
-/// Games found by a previous [`scan_games`], persisted so a restart doesn't
-/// require re-scanning (`config.yaml`'s `sync.discovered_games`).
-#[tauri::command]
-async fn discovered_games(state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
-    with_ludusavi(&state, |l| Ok(l.discovered_games()))
 }
 
 /// Current cloud remote/path/rclone status, for the settings screen.
@@ -585,7 +575,6 @@ pub fn run() {
             sync_status_batch,
             wine_prefix_check,
             enabled_games,
-            discovered_games,
             search_games,
             game_cover,
             set_custom_cover,

@@ -87,7 +87,6 @@ function SyncScreen({
   onScanningChange: (scanning: boolean) => void;
 }) {
   const [enabledGames, setEnabledGames] = useState<string[]>([]);
-  const [discoveredGames, setDiscoveredGames] = useState<string[]>([]);
   const [query, setQuery] = useState("");
   const [searchResults, setSearchResults] = useState<string[]>([]);
   const [scanResults, setScanResults] = useState<Record<string, ScanResult>>({});
@@ -131,12 +130,6 @@ function SyncScreen({
       .catch((e) => setError(String(e)));
   }
 
-  function refreshDiscovered() {
-    invoke<string[]>("discovered_games")
-      .then(setDiscoveredGames)
-      .catch((e) => setError(String(e)));
-  }
-
   // One `settings.config` read for every starred game, batched - see
   // `sync_status_batch` on `Ludusavi`. Games with no cloud record simply have no key.
   function refreshSyncBadges(games: string[]) {
@@ -149,11 +142,13 @@ function SyncScreen({
       .catch((e) => setError(String(e)));
   }
 
-  // Load both the starred games (always shown) and the persisted scan results,
-  // so a restart doesn't force a manual re-scan.
+  // Only the starred games persist across restarts. Scan results are a snapshot
+  // of what was on disk when you pressed Scan and deliberately aren't kept - so a
+  // game whose saves you since deleted drops off the next launch instead of
+  // lingering as a ghost. Each starred game's own file list is rescanned fresh
+  // whenever its modal opens.
   useEffect(() => {
     refreshEnabled();
-    refreshDiscovered();
   }, []);
 
   // Re-fetch badges whenever the starred set changes (mount, star/unstar).
@@ -185,7 +180,6 @@ function SyncScreen({
       const results = await invoke<ScanResult[]>("scan_games");
       if (id !== scanIdRef.current) return;
       setScanResults(Object.fromEntries(results.map((r) => [r.name, r])));
-      refreshDiscovered();
     } catch (e) {
       if (id === scanIdRef.current) setError(String(e));
     } finally {
@@ -295,16 +289,11 @@ function SyncScreen({
   }
 
   // One unified, deduplicated list: everything enabled (starred), plus whatever
-  // the search or a Scan turned up that isn't already in that set. Starred games
-  // always sort first, so starring/unstarring is what controls both "is this a
-  // push/pull target" and "is this near the top".
+  // the search or this session's Scan turned up that isn't already in that set.
+  // Starred games always sort first, so starring/unstarring is what controls
+  // both "is this a push/pull target" and "is this near the top".
   const enabledSet = new Set(enabledGames);
-  const names = new Set<string>([
-    ...enabledGames,
-    ...discoveredGames,
-    ...searchResults,
-    ...Object.keys(scanResults),
-  ]);
+  const names = new Set<string>([...enabledGames, ...searchResults, ...Object.keys(scanResults)]);
   const rows = [...names].sort((a, b) => {
     const aEnabled = enabledSet.has(a);
     const bEnabled = enabledSet.has(b);

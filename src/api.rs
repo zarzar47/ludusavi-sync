@@ -631,21 +631,6 @@ impl Ludusavi {
         self.config.save();
     }
 
-    /// Games found by a recent full scan (`config.yaml`'s `sync.discovered_games`).
-    /// Persisted so a restart doesn't require re-scanning.
-    pub fn discovered_games(&self) -> Vec<String> {
-        self.config.sync.discovered_games.iter().cloned().collect()
-    }
-
-    /// Replace the persisted set of scan-discovered games.
-    ///
-    /// A successful full-library scan is authoritative for what's installed right now,
-    /// so this replaces rather than unions - uninstalled games get pruned naturally.
-    pub fn set_discovered_games(&mut self, names: impl IntoIterator<Item = String>) {
-        self.config.sync.discovered_games = names.into_iter().collect();
-        self.config.save();
-    }
-
     /// Push a single game's local backup to the cloud.
     /// Additive on the destination - never deletes another game's cloud data.
     ///

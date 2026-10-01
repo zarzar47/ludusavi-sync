@@ -1197,15 +1197,10 @@ pub struct SyncConfig {
     /// Games enabled for cloud sync (by game name).
     /// Only games in this set will appear as cards with push/pull buttons.
     pub enabled_games: std::collections::BTreeSet<String>,
-    /// Games found by a recent scan (installed locally with actual save data).
-    /// Persisted so the UI doesn't need to re-scan on every launch; a fresh full
-    /// scan replaces this set.
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
-    pub discovered_games: BTreeSet<String>,
 }
 
 fn is_sync_config_default(sync: &SyncConfig) -> bool {
-    sync.enabled_games.is_empty() && sync.discovered_games.is_empty()
+    sync.enabled_games.is_empty()
 }
 
 impl Default for Cloud {
