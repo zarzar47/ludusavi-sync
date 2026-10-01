@@ -13,6 +13,7 @@ use crate::{
         layout::{BackupLayout, BackupSemantics},
         prepare_backup_target, scan_game_for_backup, semantic,
     },
+    sync,
 };
 
 pub use crate::{
@@ -266,6 +267,7 @@ impl Ludusavi {
                     &self.config.backup.format,
                     retention,
                     self.config.backup.only_constructive,
+                    cancel.as_ref(),
                 )
             };
             log::trace!("step {i} completed");
@@ -296,7 +298,7 @@ impl Ludusavi {
 
         if cancel.as_ref().is_some_and(|c| c.is_cancelled()) {
             log::info!("backup cancelled by request");
-            return Ok(reporter.json_output().unwrap_or_default());
+            return Err(Error::Cancelled);
         }
 
         if should_sync_cloud_after {
@@ -346,6 +348,7 @@ impl Ludusavi {
             resolve_cloud_conflict,
             include_disabled,
             skip_downgrade,
+            cancel,
         }: parameters::Restore,
     ) -> Result<ApiOutput, Error> {
         let mut reporter = report::Reporter::json();
@@ -487,7 +490,7 @@ impl Ludusavi {
             {
                 None
             } else {
-                Some(layout.restore(&scan_info, &self.config.restore.toggled_registry))
+                Some(layout.restore(&scan_info, &self.config.restore.toggled_registry, cancel.as_ref()))
             };
             log::trace!("step {i} completed");
             if !scan_info.can_report_game() {
@@ -503,9 +506,22 @@ impl Ludusavi {
         let info: Vec<_> = games
             .par_iter()
             .enumerate()
-            .filter_map(|(i, name)| step(i, name))
+            .filter_map(|(i, name)| {
+                // Cooperative cancellation: skip any game not yet started. Games already
+                // in flight stop between files (see `GameLayout::restore`).
+                if cancel.as_ref().is_some_and(|c| c.is_cancelled()) {
+                    None
+                } else {
+                    step(i, name)
+                }
+            })
             .collect();
         log::info!("completed restore");
+
+        if cancel.as_ref().is_some_and(|c| c.is_cancelled()) {
+            log::info!("restore cancelled by request");
+            return Err(Error::Cancelled);
+        }
 
         for (_, scan_info, _, _, failure) in info.iter() {
             if let Some(failure) = failure {
@@ -646,10 +662,31 @@ impl Ludusavi {
         finality: Finality,
         on_progress: Option<&mut dyn FnMut(crate::sync::SyncProgress)>,
     ) -> Result<crate::sync::SyncResult, Error> {
+        self.sync_push_hooked(
+            game,
+            finality,
+            crate::sync::SyncHooks {
+                on_phase: None,
+                on_progress,
+                cancel: None,
+            },
+        )
+    }
+
+    /// [`Self::sync_push`], plus the phase/cancel hooks a UI needs: `on_phase` fires as
+    /// the operation moves between its steps, and `cancel` is honoured at every step
+    /// boundary and within the copy/transfer loops (see `sync.rs` and `scan/layout.rs`).
+    pub fn sync_push_hooked(
+        &mut self,
+        game: &str,
+        finality: Finality,
+        mut hooks: crate::sync::SyncHooks<'_>,
+    ) -> Result<crate::sync::SyncResult, Error> {
         let Some(game) = self.title_finder.find_one_by_name(game) else {
             return Err(Error::GameIsUnrecognized);
         };
 
+        hooks.phase(sync::SyncPhase::BackingUp);
         let original_sync = self.config.cloud.synchronize;
         self.config.cloud.synchronize = false;
         let backup_result = self.back_up(parameters::BackUp {
@@ -659,18 +696,20 @@ impl Ludusavi {
             wine_prefix: None,
             include_disabled: true,
             skip_downgrade: false,
-            cancel: None,
+            cancel: hooks.cancel.clone(),
         });
         self.config.cloud.synchronize = original_sync;
         backup_result?;
 
+        hooks.phase(sync::SyncPhase::Uploading);
         crate::sync::push_game(
             &self.config,
             &self.config.backup.path,
             &self.config.cloud.path,
             &game,
             finality,
-            on_progress,
+            hooks.on_progress.take(),
+            hooks.cancel.as_ref(),
         )
     }
 
@@ -689,19 +728,42 @@ impl Ludusavi {
         finality: Finality,
         on_progress: Option<&mut dyn FnMut(crate::sync::SyncProgress)>,
     ) -> Result<crate::sync::SyncResult, Error> {
+        self.sync_pull_hooked(
+            game,
+            finality,
+            crate::sync::SyncHooks {
+                on_phase: None,
+                on_progress,
+                cancel: None,
+            },
+        )
+    }
+
+    /// [`Self::sync_pull`], plus the same phase/cancel hooks as
+    /// [`Self::sync_push_hooked`]. Cancelling during the download skips the restore
+    /// entirely, so the live save is never left half-written.
+    pub fn sync_pull_hooked(
+        &mut self,
+        game: &str,
+        finality: Finality,
+        mut hooks: crate::sync::SyncHooks<'_>,
+    ) -> Result<crate::sync::SyncResult, Error> {
         let Some(game) = self.title_finder.find_one_by_name(game) else {
             return Err(Error::GameIsUnrecognized);
         };
 
+        hooks.phase(sync::SyncPhase::Downloading);
         let result = crate::sync::pull_game(
             &self.config,
             &self.config.backup.path,
             &self.config.cloud.path,
             &game,
             finality,
-            on_progress,
+            hooks.on_progress.take(),
+            hooks.cancel.as_ref(),
         )?;
 
+        hooks.phase(sync::SyncPhase::Restoring);
         let original_sync = self.config.cloud.synchronize;
         self.config.cloud.synchronize = false;
         let restore_result = self.restore(parameters::Restore {
@@ -711,6 +773,7 @@ impl Ludusavi {
             resolve_cloud_conflict: None,
             include_disabled: true,
             skip_downgrade: false,
+            cancel: hooks.cancel.clone(),
         });
         self.config.cloud.synchronize = original_sync;
         restore_result?;
@@ -967,6 +1030,11 @@ pub mod parameters {
         /// and you don't want to accidentally back up that old save again.
         /// (If the save file gets updated during play, it will be considered newer.)
         pub skip_downgrade: bool,
+        /// Cooperative cancellation token checked between files, so a long restore can be
+        /// cut short. Files not reached are reported as failed, not silently skipped, so
+        /// the next restore still knows they differ from the backup.
+        /// `None` (the default) runs the operation to completion.
+        pub cancel: Option<Cancel>,
     }
 
     #[derive(Clone, Debug, Default, PartialEq, Eq)]

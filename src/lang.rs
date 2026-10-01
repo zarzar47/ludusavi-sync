@@ -428,6 +428,8 @@ impl Translator {
                 )
             }
             Error::CloudConflict => TRANSLATOR.prefix_error(&TRANSLATOR.cloud_synchronize_conflict()),
+            // Fork addition (cancellation); hardcoded like the other fork-only errors below.
+            Error::Cancelled => "Cancelled.".to_string(),
             Error::GameDidNotLaunch { why } => format!("{}\n\n{}", self.game_did_not_launch(), self.prefix_error(why)),
             Error::WinePrefixNotFound { game, backup_prefix } => self.wine_prefix_not_found(game, backup_prefix),
             // Fork addition (cover art); hardcoded like the other fork-only errors above.

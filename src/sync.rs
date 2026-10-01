@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use crate::{
     cloud::{self, CloudChange, Rclone, RcloneProcessEvent},
-    prelude::{Error, Finality, StrictPath, SyncDirection},
+    prelude::{Cancel, Error, Finality, StrictPath, SyncDirection},
     resource::{
         config::Config,
         sync_state::{self, GameSyncEntry, SyncStateFile},
@@ -26,21 +26,70 @@ pub struct SyncProgress {
     pub max: f32,
 }
 
+/// Which step of a push/pull is currently running, for a UI that wants to say more
+/// than "working…" while the transfer bar sits still.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyncPhase {
+    /// Taking a fresh local backup of the game (push only) - no byte progress, since
+    /// ludusavi's reporter doesn't stream per-file counts.
+    BackingUp,
+    /// Copying the game's backup folder to the cloud.
+    Uploading,
+    /// Copying the game's backup folder down from the cloud.
+    Downloading,
+    /// Writing the pulled backup over the current local save (pull only).
+    Restoring,
+}
+
+/// Optional callbacks for driving a push/pull from a UI: phase transitions, rclone byte
+/// progress, and a cooperative cancel token. Every field is optional - a caller that
+/// only wants the result can pass `SyncHooks::default()`.
+#[derive(Default)]
+pub struct SyncHooks<'a> {
+    pub on_phase: Option<&'a mut dyn FnMut(SyncPhase)>,
+    pub on_progress: Option<&'a mut dyn FnMut(SyncProgress)>,
+    pub cancel: Option<Cancel>,
+}
+
+impl SyncHooks<'_> {
+    /// Announce a phase transition, if anyone is listening.
+    pub fn phase(&mut self, phase: SyncPhase) {
+        if let Some(f) = self.on_phase.as_mut() {
+            f(phase);
+        }
+    }
+}
+
 /// Wait for an rclone process to complete, collecting changes.
 /// Includes a small sleep to avoid CPU spin.
 ///
 /// Whenever `on_progress` is set, it is invoked once up front (with a zeroed
 /// [`SyncProgress`]) so a UI can show "starting" before the first stats line
 /// arrives, then on every progress report rclone emits.
+///
+/// `cancel` is checked once per poll (~10ms). rclone has no cooperative protocol of
+/// its own here, so cancelling means killing the child process - which is why this
+/// is the one place a transfer is actually interruptible.
 fn wait_for_rclone(
     process: &mut crate::cloud::RcloneProcess,
     mut on_progress: Option<&mut dyn FnMut(SyncProgress)>,
+    cancel: Option<&Cancel>,
 ) -> Result<Vec<CloudChange>, Error> {
     let mut changes = vec![];
     if let Some(f) = on_progress.as_mut() {
         f(SyncProgress { current: 0.0, max: 0.0 });
     }
     loop {
+        if let Some(cancel) = cancel
+            && cancel.is_cancelled()
+        {
+            log::info!("cancelling rclone");
+            // Best-effort: the child may have exited on its own between the check and
+            // the kill, which isn't a failure worth reporting.
+            let _ = process.kill();
+            return Err(Error::Cancelled);
+        }
+
         let events = process.events();
         for event in events {
             match event {
@@ -64,7 +113,13 @@ fn wait_for_rclone(
 }
 
 /// Upload settings.config to the cloud after a push.
-fn upload_sync_state(rclone: &Rclone, backup_dir: &StrictPath, cloud_path: &str, finality: Finality) {
+fn upload_sync_state(
+    rclone: &Rclone,
+    backup_dir: &StrictPath,
+    cloud_path: &str,
+    finality: Finality,
+    cancel: Option<&Cancel>,
+) {
     if finality.preview() {
         return;
     }
@@ -81,8 +136,12 @@ fn upload_sync_state(rclone: &Rclone, backup_dir: &StrictPath, cloud_path: &str,
             return;
         }
     };
-    if let Err(e) = wait_for_rclone(&mut process, None) {
-        log::error!("Failed to upload settings.config: {:?}", e);
+    if let Err(e) = wait_for_rclone(&mut process, None, cancel) {
+        // Cancelling the transfer is legitimate here; anything else is worth logging,
+        // but never worth failing the push over - the game files are already up.
+        if e != Error::Cancelled {
+            log::error!("Failed to upload settings.config: {:?}", e);
+        }
     }
 }
 
@@ -98,6 +157,7 @@ fn fetch_cloud_sync_state(
     backup_dir: &StrictPath,
     cloud_path: &str,
     finality: Finality,
+    cancel: Option<&Cancel>,
 ) -> Option<SyncStateFile> {
     if finality.preview() {
         return None;
@@ -120,7 +180,7 @@ fn fetch_cloud_sync_state(
                 &[SyncStateFile::FILE_NAME.to_string()],
             )
             .map_err(|e| format!("failed to start download: {e:?}"))?;
-        wait_for_rclone(&mut process, None).map_err(|e| format!("download failed: {e:?}"))?;
+        wait_for_rclone(&mut process, None, cancel).map_err(|e| format!("download failed: {e:?}"))?;
 
         if !staging.joined(SyncStateFile::FILE_NAME).is_file() {
             // Cloud has no state file yet; nothing to merge.
@@ -150,10 +210,11 @@ fn merge_cloud_sync_state(
     backup_dir: &StrictPath,
     cloud_path: &str,
     finality: Finality,
+    cancel: Option<&Cancel>,
 ) -> SyncStateFile {
     let mut local = SyncStateFile::load_from(backup_dir);
 
-    if let Some(cloud) = fetch_cloud_sync_state(rclone, backup_dir, cloud_path, finality) {
+    if let Some(cloud) = fetch_cloud_sync_state(rclone, backup_dir, cloud_path, finality, cancel) {
         local.merge_from(&cloud);
         if let Err(e) = local.save_to(backup_dir) {
             log::error!("Failed to save merged sync state: {:?}", e);
@@ -187,6 +248,11 @@ fn local_wine_prefix(layout: &BackupLayout, game_name: &str) -> Option<String> {
 /// 2. Locates the game's backup folder
 /// 3. Uploads via rclone copy (additive - no deletes)
 /// 4. Merges + uploads settings.config, recording this device's Wine prefix
+///
+/// `cancel` is honoured at every rclone step: the transfer is killed and
+/// [`Error::Cancelled`] returned. Files already uploaded stay uploaded - a push is
+/// additive, so a half-finished one leaves the cloud in a consistent (if
+/// incomplete) state rather than a corrupt one.
 pub fn push_game(
     config: &Config,
     backup_dir: &StrictPath,
@@ -194,6 +260,7 @@ pub fn push_game(
     game_name: &str,
     finality: Finality,
     on_progress: Option<&mut dyn FnMut(SyncProgress)>,
+    cancel: Option<&Cancel>,
 ) -> Result<SyncResult, Error> {
     log::info!("pushing game: {}", game_name);
 
@@ -217,13 +284,14 @@ pub fn push_game(
         Err(e) => return Err(Error::UnableToSynchronizeCloud(e)),
     };
 
-    let changes = wait_for_rclone(&mut process, on_progress)?;
+    let changes = wait_for_rclone(&mut process, on_progress, cancel)?;
+    log::info!("pushed {} change(s) for {}", changes.len(), game_name);
 
     // Update local settings.config and upload to cloud.
     if !finality.preview() {
         // Merge the cloud's state in first, so pushing can't drop entries (or other
         // devices' recorded prefixes) that this device has never seen.
-        let mut sync_state = merge_cloud_sync_state(&rclone, backup_dir, cloud_path, finality);
+        let mut sync_state = merge_cloud_sync_state(&rclone, backup_dir, cloud_path, finality, cancel);
 
         sync_state.merge_game(game_name, SyncStateFile::push_entry(game_name));
 
@@ -237,7 +305,7 @@ pub fn push_game(
         if let Err(e) = sync_state.save_to(backup_dir) {
             log::error!("Failed to save sync state locally: {:?}", e);
         }
-        upload_sync_state(&rclone, backup_dir, cloud_path, finality);
+        upload_sync_state(&rclone, backup_dir, cloud_path, finality, cancel);
     }
 
     Ok(SyncResult {
@@ -253,6 +321,12 @@ pub fn push_game(
 /// 2. Downloads settings.config from cloud
 /// 3. Downloads the game's backup folder via rclone copy (additive)
 /// 4. Merges cloud metadata into local state
+///
+/// `cancel` is honoured at every rclone step (the download is killed and
+/// [`Error::Cancelled`] returned), but the caller - not this function - owns the
+/// restore that normally follows, so a cancelled pull never reaches the live save.
+/// What it can leave behind is a partially downloaded folder in backup storage:
+/// re-pulling picks up where it left off, since rclone copies only what's missing.
 pub fn pull_game(
     config: &Config,
     backup_dir: &StrictPath,
@@ -260,6 +334,7 @@ pub fn pull_game(
     game_name: &str,
     finality: Finality,
     on_progress: Option<&mut dyn FnMut(SyncProgress)>,
+    cancel: Option<&Cancel>,
 ) -> Result<SyncResult, Error> {
     log::info!("pulling game: {}", game_name);
 
@@ -273,7 +348,7 @@ pub fn pull_game(
 
     // Merge the cloud's settings.config into the local one first, so the game's
     // per-device prefix registry is available to the restore that follows.
-    let sync_state = merge_cloud_sync_state(&rclone, backup_dir, cloud_path, finality);
+    let sync_state = merge_cloud_sync_state(&rclone, backup_dir, cloud_path, finality, cancel);
 
     if !finality.preview() && !config.scan.redirect_wine {
         log::warn!(
@@ -294,7 +369,8 @@ pub fn pull_game(
         Err(e) => return Err(Error::UnableToSynchronizeCloud(e)),
     };
 
-    let changes = wait_for_rclone(&mut process, on_progress)?;
+    let changes = wait_for_rclone(&mut process, on_progress, cancel)?;
+    log::info!("pulled {} change(s) for {}", changes.len(), game_name);
 
     if !finality.preview()
         && let Some(info) = sync_state.game_info(game_name)

@@ -7,7 +7,7 @@ use chrono::{Datelike, Timelike};
 
 use crate::{
     path::StrictPath,
-    prelude::{AnyError, Error, INVALID_FILE_CHARS},
+    prelude::{AnyError, Cancel, Error, INVALID_FILE_CHARS},
     resource::{
         config::{
             BackupFormat, BackupFormats, RedirectConfig, Retention, ToggledPaths, ToggledRegistry, ZipCompression,
@@ -25,6 +25,28 @@ use crate::scan::ScannedRegistry;
 
 const SAFE: &str = "_";
 const SOLO: &str = ".";
+
+/// Mark the files a cancelled backup never reached as failed.
+///
+/// Going through `BackupInfo::failed_files` (rather than just breaking out of the copy
+/// loop) is what keeps the recorded backup honest: `Backup::prune_failures` drops these
+/// from the new backup's mapping, and `Backup::needed` then declines to record it at all
+/// if nothing was copied - so a cancel mid-backup leaves the previous backups untouched
+/// instead of a half-populated one that claims to be complete.
+fn mark_remaining_cancelled(
+    backup_info: &mut BackupInfo,
+    backup: &Backup,
+    remaining: &[(&StrictPath, &ScannedFile)],
+) {
+    for (scan_key, file) in remaining {
+        if !backup.includes_file(file.mapping_key(scan_key)) {
+            continue;
+        }
+        backup_info
+            .failed_files
+            .insert((*scan_key).clone(), BackupError::App(Error::Cancelled));
+    }
+}
 
 macro_rules! some_or_continue {
     ($maybe:expr) => {
@@ -1219,11 +1241,29 @@ impl GameLayout {
         }
     }
 
-    fn execute_backup_as_simple(&mut self, backup: &Backup, scan: &ScanInfo) -> BackupInfo {
+    fn execute_backup_as_simple(
+        &mut self,
+        backup: &Backup,
+        scan: &ScanInfo,
+        cancel: Option<&Cancel>,
+    ) -> BackupInfo {
         let mut backup_info = BackupInfo::default();
 
         let mut relevant_files = vec![];
-        for (scan_key, file) in &scan.found_files {
+        let entries: Vec<_> = scan.found_files.iter().collect();
+        for (i, (scan_key, file)) in entries.iter().copied().enumerate() {
+            if let Some(cancel) = cancel
+                && cancel.is_cancelled()
+            {
+                log::info!(
+                    "[{}] backup cancelled after {} file(s)",
+                    &self.mapping.name,
+                    i
+                );
+                mark_remaining_cancelled(&mut backup_info, backup, &entries[i..]);
+                break;
+            }
+
             if !backup.includes_file(file.mapping_key(scan_key)) {
                 log::debug!("[{}] skipped: {}", self.mapping.name, scan_key.raw());
                 continue;
@@ -1273,7 +1313,13 @@ impl GameLayout {
         backup_info
     }
 
-    fn execute_backup_as_zip(&mut self, backup: &Backup, scan: &ScanInfo, format: &BackupFormats) -> BackupInfo {
+    fn execute_backup_as_zip(
+        &mut self,
+        backup: &Backup,
+        scan: &ScanInfo,
+        format: &BackupFormats,
+        cancel: Option<&Cancel>,
+    ) -> BackupInfo {
         let mut backup_info = BackupInfo::default();
 
         let fail_file = |file: &StrictPath, backup_info: &mut BackupInfo, error: String| {
@@ -1311,7 +1357,16 @@ impl GameLayout {
             .compression_level(format.level())
             .large_file(true);
 
-        'item: for (scan_key, file) in &scan.found_files {
+        let entries: Vec<_> = scan.found_files.iter().collect();
+        'item: for (i, (scan_key, file)) in entries.iter().copied().enumerate() {
+            if let Some(cancel) = cancel
+                && cancel.is_cancelled()
+            {
+                log::info!("[{}] backup cancelled after {} file(s)", &self.mapping.name, i);
+                mark_remaining_cancelled(&mut backup_info, backup, &entries[i..]);
+                break 'item;
+            }
+
             if !backup.includes_file(file.mapping_key(scan_key)) {
                 log::debug!("[{}] skipped: {:?}", self.mapping.name, &scan_key);
                 continue;
@@ -1486,13 +1541,19 @@ impl GameLayout {
         }
     }
 
-    fn execute_backup(&mut self, backup: &Backup, scan: &ScanInfo, format: &BackupFormats) -> BackupInfo {
+    fn execute_backup(
+        &mut self,
+        backup: &Backup,
+        scan: &ScanInfo,
+        format: &BackupFormats,
+        cancel: Option<&Cancel>,
+    ) -> BackupInfo {
         if backup.only_inherits_and_overrides() {
             BackupInfo::default()
         } else {
             match format.chosen {
-                BackupFormat::Simple => self.execute_backup_as_simple(backup, scan),
-                BackupFormat::Zip => self.execute_backup_as_zip(backup, scan, format),
+                BackupFormat::Simple => self.execute_backup_as_simple(backup, scan, cancel),
+                BackupFormat::Zip => self.execute_backup_as_zip(backup, scan, format, cancel),
             }
         }
     }
@@ -1600,6 +1661,13 @@ impl GameLayout {
         Some(())
     }
 
+    /// Create a backup for `scan`, copying any changed files.
+    ///
+    /// `cancel` is checked between files. Cancelling marks the files it hadn't reached
+    /// yet as failed rather than skipping them, so `prune_failures` drops them from the
+    /// new backup's mapping and the previously-recorded backups stay authoritative -
+    /// i.e. a cancelled backup leaves the same state as a partial one that failed for
+    /// any other reason.
     pub fn back_up(
         &mut self,
         scan: &ScanInfo,
@@ -1607,6 +1675,7 @@ impl GameLayout {
         format: &BackupFormats,
         retention: Retention,
         only_constructive: bool,
+        cancel: Option<&Cancel>,
     ) -> Option<BackupInfo> {
         if !scan.found_anything() {
             log::trace!("[{}] nothing to back up", &scan.game_name);
@@ -1641,7 +1710,7 @@ impl GameLayout {
                     backup.kind(),
                     backup.name()
                 );
-                let backup_info = self.execute_backup(&backup, scan, format);
+                let backup_info = self.execute_backup(&backup, scan, format, cancel);
                 backup.prune_failures(&backup_info);
                 if backup.needed() {
                     self.insert_backup(backup.clone());
@@ -1778,10 +1847,16 @@ impl GameLayout {
         }
     }
 
+    /// Restore `scan`'s files from its backup.
+    ///
+    /// `cancel` is checked between files; the files not reached are reported as failed
+    /// rather than skipped, so a later restore still sees them as differing from the
+    /// backup and picks them up.
     pub fn restore(
         &self,
         scan: &ScanInfo,
         #[cfg_attr(not(target_os = "windows"), allow(unused))] toggled: &ToggledRegistry,
+        cancel: Option<&Cancel>,
     ) -> BackupInfo {
         log::trace!("[{}] beginning restore", &scan.game_name);
 
@@ -1792,7 +1867,21 @@ impl GameLayout {
         let mut containers: HashMap<StrictPath, zip::ZipArchive<std::fs::File>> = HashMap::new();
         let mut failed_containers: HashMap<StrictPath, BackupError> = HashMap::new();
 
-        for (scan_key, file) in &scan.found_files {
+        let entries: Vec<_> = scan.found_files.iter().collect();
+        for (i, (scan_key, file)) in entries.iter().copied().enumerate() {
+            if let Some(cancel) = cancel
+                && cancel.is_cancelled()
+            {
+                log::info!("[{}] restore cancelled after {} file(s)", &self.mapping.name, i);
+                for (remaining_key, remaining_file) in &entries[i..] {
+                    if !remaining_file.change().is_changed() || remaining_file.ignored {
+                        continue;
+                    }
+                    failed_files.insert((*remaining_key).clone(), BackupError::App(Error::Cancelled));
+                }
+                break;
+            }
+
             let target = file.effective(scan_key);
 
             if !file.change().is_changed() || file.ignored {

@@ -396,6 +396,7 @@ pub fn run(sub: Subcommand, no_manifest_update: bool, try_manifest_update: bool)
                             &backup_format(),
                             retention,
                             config.backup.only_constructive,
+                            None,
                         ),
                         Ok(false) | Err(_) => None,
                     }
@@ -406,6 +407,7 @@ pub fn run(sub: Subcommand, no_manifest_update: bool, try_manifest_update: bool)
                         &backup_format(),
                         retention,
                         config.backup.only_constructive,
+                        None,
                     )
                 };
                 log::trace!("step {i} completed");
@@ -698,11 +700,11 @@ pub fn run(sub: Subcommand, no_manifest_update: bool, try_manifest_update: bool)
                         &TRANSLATOR.backup_is_older_than_current_data(),
                         &TRANSLATOR.restore_one_game_confirm(name),
                     ) {
-                        Ok(true) => Some(layout.restore(&scan_info, &config.restore.toggled_registry)),
+                        Ok(true) => Some(layout.restore(&scan_info, &config.restore.toggled_registry, None)),
                         Ok(false) | Err(_) => None,
                     }
                 } else {
-                    Some(layout.restore(&scan_info, &config.restore.toggled_registry))
+                    Some(layout.restore(&scan_info, &config.restore.toggled_registry, None))
                 };
                 log::trace!("step {i} completed");
                 if !scan_info.can_report_game() {

@@ -122,6 +122,10 @@ pub enum Error {
     UnableToConfigureCloud(CommandError),
     UnableToSynchronizeCloud(CommandError),
     CloudConflict,
+    /// The operation was cancelled by request (a UI "Cancel" button, or Ctrl-C on the
+    /// CLI). Distinct from a failure: whatever was copied before the cancel is still
+    /// valid, and the caller should report it as "cancelled", not "error".
+    Cancelled,
     GameDidNotLaunch {
         why: String,
     },
