@@ -427,6 +427,13 @@ impl Translator {
                     self.handle_command_error(error)
                 )
             }
+            // Fork addition (cloud quota); hardcoded like the other fork-only errors.
+            Error::CloudStorageQuotaExceeded => {
+                "Cloud storage is full: the remote refused the upload because the \
+                 account has run out of space (e.g. Google Drive's storage quota). \
+                 Free up space there, then try again."
+                    .to_string()
+            }
             Error::CloudConflict => TRANSLATOR.prefix_error(&TRANSLATOR.cloud_synchronize_conflict()),
             // Fork addition (cancellation); hardcoded like the other fork-only errors below.
             Error::Cancelled => "Cancelled.".to_string(),

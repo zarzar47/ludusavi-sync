@@ -104,6 +104,18 @@ fn wait_for_rclone(
                 RcloneProcessEvent::Change(change) => {
                     changes.push(change);
                 }
+                RcloneProcessEvent::Notice { msg, .. } if cloud::is_quota_exceeded(&msg) => {
+                    // Retrying is pointless: the remote will reject everything until
+                    // the account has space again. rclone's own backoff would keep
+                    // grinding for ~ten more minutes before reporting the same thing.
+                    log::error!("aborting transfer: cloud storage quota exceeded ({msg})");
+                    let _ = process.kill();
+                    let _ = process.reap();
+                    return Err(Error::CloudStorageQuotaExceeded);
+                }
+                RcloneProcessEvent::Notice { .. } => {
+                    // Already kept by the process itself for the failure message.
+                }
             }
         }
         match process.succeeded() {

@@ -121,6 +121,11 @@ pub enum Error {
     CloudPathInvalid,
     UnableToConfigureCloud(CommandError),
     UnableToSynchronizeCloud(CommandError),
+    /// The remote refused the transfer because the account is out of storage (e.g.
+    /// Google Drive's quota). Distinct from [`Self::UnableToSynchronizeCloud`] because
+    /// no amount of retrying helps - the user has to free up space first - so it gets
+    /// a direct message instead of a dump of rclone's retry noise.
+    CloudStorageQuotaExceeded,
     CloudConflict,
     /// The operation was cancelled by request (a UI "Cancel" button, or Ctrl-C on the
     /// CLI). Distinct from a failure: whatever was copied before the cancel is still

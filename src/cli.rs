@@ -1572,6 +1572,18 @@ fn sync_cloud(
                 crate::cloud::RcloneProcessEvent::Change(change) => {
                     changes.push(change);
                 }
+                crate::cloud::RcloneProcessEvent::Notice { msg, .. }
+                    if crate::cloud::is_quota_exceeded(&msg) =>
+                {
+                    // No point serving out rclone's retry backoff: the remote rejects
+                    // everything until the account has space again.
+                    let _ = process.kill();
+                    let _ = process.reap();
+                    unregister_sigint();
+                    progress_bar.finish_and_clear();
+                    return Err(Error::CloudStorageQuotaExceeded);
+                }
+                crate::cloud::RcloneProcessEvent::Notice { .. } => {}
             }
         }
         match process.succeeded() {

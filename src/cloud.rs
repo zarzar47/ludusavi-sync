@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io::{BufRead, BufReader};
 
 use crate::{
@@ -6,6 +7,12 @@ use crate::{
     resource::config::{App, Config},
     scan::ScanChange,
 };
+
+/// How many of rclone's own error/notice lines are kept for the failure message.
+/// rclone's final "Failed to copy with N errors: last error was: ..." line is the one
+/// that explains a transfer; a handful above it is enough context, and a cap keeps a
+/// pathological run from turning the error into a log dump.
+const MAX_RCLONE_DIAGNOSTICS: usize = 5;
 
 /// Escape rclone filter glob metacharacters so a folder name is matched
 /// literally. Game names can legally contain characters that rclone's filter
@@ -21,6 +28,79 @@ fn escape_rclone_glob(name: &str) -> String {
         out.push(c);
     }
     out
+}
+
+/// Whether a message is rclone complaining about the remote being out of storage.
+///
+/// Google Drive rejects every upload once the account's quota is spent
+/// (`googleapi: Error 403: ... storageQuotaExceeded`); other providers word it
+/// differently but all say "quota" in some form. Such a failure is not worth
+/// retrying: every retry fails the same way, which is what used to turn a full
+/// Drive into an eleven-minute hang before a meaningless "fatal error".
+pub fn is_quota_exceeded(msg: &str) -> bool {
+    if msg.contains("storageQuotaExceeded") {
+        return true;
+    }
+    let lower = msg.to_lowercase();
+    lower.contains("quota") && lower.contains("exceeded")
+}
+
+/// One classified line of rclone's `--use-json-log` output.
+#[derive(Debug)]
+enum ParsedRcloneLine {
+    Skip { skipped: String, object: String },
+    Change { msg: String, object: String },
+    Progress { current: f32, max: f32, last_error: Option<String> },
+    Note { level: String, msg: String },
+    Ignored,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase", untagged)]
+enum RawRcloneLine {
+    Skip { skipped: String, object: String },
+    Change { msg: String, object: String },
+    Stats { stats: RawStats },
+    Note { msg: String, level: String },
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawStats {
+    bytes: f32,
+    total_bytes: f32,
+    /// The last backend error rclone saw, e.g. a Drive quota rejection. It shows up
+    /// here (within a `--stats` interval of the first failure) long before rclone's
+    /// own retry loop gives up - which is what makes failing fast possible.
+    last_error: Option<String>,
+}
+
+/// Classify one line of rclone's JSON log. Extracted from [`RcloneProcess::events`]
+/// so the shape of rclone's output can be tested without spawning a transfer.
+fn parse_rclone_line(line: &str) -> ParsedRcloneLine {
+    match serde_json::from_str::<RawRcloneLine>(line) {
+        Ok(RawRcloneLine::Skip { skipped, object }) => ParsedRcloneLine::Skip { skipped, object },
+        Ok(RawRcloneLine::Change { msg, object }) => ParsedRcloneLine::Change { msg, object },
+        Ok(RawRcloneLine::Stats {
+            stats:
+                RawStats {
+                    bytes,
+                    total_bytes,
+                    last_error,
+                },
+        }) => ParsedRcloneLine::Progress {
+            current: bytes,
+            max: total_bytes,
+            last_error,
+        },
+        Ok(RawRcloneLine::Note { msg, level }) => ParsedRcloneLine::Note { level, msg },
+        Err(_) => ParsedRcloneLine::Ignored,
+    }
+}
+
+/// Log levels at which rclone is stating a problem (as opposed to narrating progress).
+fn is_diagnostic_level(level: &str) -> bool {
+    matches!(level, "error" | "notice" | "critical" | "fatal")
 }
 
 pub fn validate_cloud_config(config: &Config, cloud_path: &str) -> Result<Remote, Error> {
@@ -52,6 +132,10 @@ pub struct CloudChange {
 pub enum RcloneProcessEvent {
     Progress { current: f32, max: f32 },
     Change(CloudChange),
+    /// A problem rclone stated in its log (error/notice level). Only quota errors are
+    /// acted on by callers so far; the rest are kept by [`RcloneProcess`] itself for
+    /// the failure message.
+    Notice { level: String, msg: String },
 }
 
 #[derive(Debug)]
@@ -60,6 +144,11 @@ pub struct RcloneProcess {
     args: Vec<String>,
     child: std::process::Child,
     stderr: Option<BufReader<std::process::ChildStderr>>,
+    /// The tail of what rclone actually complained about, kept as it streams past
+    /// [`Self::events`]. The JSON-log runs drain their own stderr for progress, so by
+    /// the time [`Self::succeeded`] reads the streams there's nothing left to report -
+    /// without this, a failed transfer surfaces as a bare exit code with no reason.
+    diagnostics: VecDeque<String>,
 }
 
 impl RcloneProcess {
@@ -94,31 +183,32 @@ impl RcloneProcess {
             args,
             child,
             stderr,
+            diagnostics: VecDeque::new(),
         })
+    }
+
+    /// Remember one of rclone's problem lines for the eventual failure message,
+    /// collapsing a repeated line (rclone retries the same error several times) and
+    /// keeping only the tail.
+    fn push_diagnostic(&mut self, level: &str, msg: &str) {
+        if self.diagnostics.back().is_some_and(|last| last.ends_with(msg)) {
+            return;
+        }
+        self.diagnostics.push_back(format!("[{level}] {msg}"));
+        while self.diagnostics.len() > MAX_RCLONE_DIAGNOSTICS {
+            self.diagnostics.pop_front();
+        }
     }
 
     pub fn events(&mut self) -> Vec<RcloneProcessEvent> {
         let mut events = vec![];
-
-        #[derive(Debug, serde::Deserialize)]
-        #[serde(rename_all = "camelCase", untagged)]
-        enum Log {
-            Skip { skipped: String, object: String },
-            Change { msg: String, object: String },
-            Stats { stats: Stats },
-        }
-
-        #[derive(Debug, serde::Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Stats {
-            bytes: f32,
-            total_bytes: f32,
-        }
+        let mut notes: Vec<(String, String)> = vec![];
+        let mut stats_last_error: Option<String> = None;
 
         if let Some(stderr) = self.stderr.as_mut() {
             for line in stderr.lines().take(10).filter_map(|x| x.ok()) {
-                match serde_json::from_str::<Log>(&line) {
-                    Ok(Log::Skip { skipped, object }) => match skipped.as_str() {
+                match parse_rclone_line(&line) {
+                    ParsedRcloneLine::Skip { skipped, object } => match skipped.as_str() {
                         "copy" => events.push(RcloneProcessEvent::Change(CloudChange {
                             path: object,
                             change: ScanChange::Different,
@@ -131,7 +221,7 @@ impl RcloneProcess {
                             log::trace!("Unhandled Rclone 'skipped': {raw}");
                         }
                     },
-                    Ok(Log::Change { msg, object }) => match msg.as_str() {
+                    ParsedRcloneLine::Change { msg, object } => match msg.as_str() {
                         "Copied (new)" => events.push(RcloneProcessEvent::Change(CloudChange {
                             path: object,
                             change: ScanChange::New,
@@ -148,21 +238,50 @@ impl RcloneProcess {
                             log::trace!("Unhandled Rclone 'msg': {raw}");
                         }
                     },
-                    Ok(Log::Stats {
-                        stats: Stats { bytes, total_bytes },
-                    }) => {
-                        if total_bytes > 0.0 {
-                            events.push(RcloneProcessEvent::Progress {
-                                current: bytes,
-                                max: total_bytes,
-                            });
+                    ParsedRcloneLine::Progress {
+                        current,
+                        max,
+                        last_error,
+                    } => {
+                        if max > 0.0 {
+                            events.push(RcloneProcessEvent::Progress { current, max });
+                        }
+                        if last_error.is_some() {
+                            stats_last_error = last_error;
                         }
                     }
-                    Err(_) => {
+                    ParsedRcloneLine::Note { level, msg } => {
+                        if is_diagnostic_level(&level) {
+                            notes.push((level, msg));
+                        }
+                    }
+                    ParsedRcloneLine::Ignored => {
                         log::trace!("Unhandled Rclone message: {line}");
                     }
                 }
             }
+        }
+
+        // Outside the stderr borrow: these need `&mut self`.
+        for (level, msg) in notes {
+            if is_quota_exceeded(&msg) {
+                events.push(RcloneProcessEvent::Notice {
+                    level: level.clone(),
+                    msg: msg.clone(),
+                });
+            }
+            self.push_diagnostic(&level, &msg);
+        }
+        // The stats stream reports the first backend error within a `--stats` interval -
+        // long before rclone's own "Attempt N/N failed" log lines, whose internal
+        // backoff is what used to stretch a full quota into an ~eleven-minute hang.
+        if let Some(err) = stats_last_error
+            && is_quota_exceeded(&err)
+        {
+            events.push(RcloneProcessEvent::Notice {
+                level: "error".to_string(),
+                msg: err,
+            });
         }
 
         if !events.is_empty() {
@@ -184,6 +303,14 @@ impl RcloneProcess {
                         let lines = x.lines().map_while(Result::ok).collect::<Vec<_>>();
                         (!lines.is_empty()).then_some(lines.join("\n"))
                     });
+                    // `events()` already drained the JSON log; the classified tail is
+                    // what actually explains the failure (and is human-readable, unlike
+                    // the raw JSON that would otherwise leak into the message).
+                    let stderr = if self.diagnostics.is_empty() {
+                        stderr
+                    } else {
+                        Some(self.diagnostics.iter().cloned().collect::<Vec<_>>().join("\n"))
+                    };
 
                     Some(Err(CommandError::Exited {
                         program: self.program.clone(),
@@ -890,7 +1017,7 @@ impl Rclone {
 
 #[cfg(test)]
 mod tests {
-    use super::escape_rclone_glob;
+    use super::{ParsedRcloneLine, escape_rclone_glob, is_quota_exceeded, parse_rclone_line};
 
     #[test]
     fn escapes_glob_metacharacters_in_folder_names() {
@@ -899,5 +1026,73 @@ mod tests {
         assert_eq!(escape_rclone_glob("Foo {Bar}"), "Foo \\{Bar\\}");
         assert_eq!(escape_rclone_glob("What?"), "What\\?");
         assert_eq!(escape_rclone_glob("A*B"), "A\\*B");
+    }
+
+    // The fixtures below are real lines from a failed Google Drive transfer
+    // (a full-quota `rclone copy` run captured2026-10-12), trimmed of nothing.
+
+    #[test]
+    fn quota_rejections_are_recognized_in_every_wording_rclone_uses() {
+        assert!(is_quota_exceeded(
+            "googleapi: Error403: The user's Drive storage quota has been exceeded., storageQuotaExceeded"
+        ));
+        assert!(is_quota_exceeded("storageQuotaExceeded"));
+        assert!(is_quota_exceeded("The user's Drive storage quota has been exceeded."));
+        assert!(!is_quota_exceeded("connection reset by peer"));
+        assert!(!is_quota_exceeded("rate limit exceeded"));
+    }
+
+    #[test]
+    fn the_final_failure_notice_parses_as_a_diagnostic_note() {
+        // This is the line that explains *why* a transfer died - the one that used to
+        // be drained by `events()` and thrown away, leaving a bare exit code.
+        let line = r#"{"time":"2026-10-12T01:15:40.650157875+05:00","level":"notice","msg":"Failed to copy with27 errors: last error was: googleapi: Error403: The user's Drive storage quota has been exceeded., storageQuotaExceeded","source":"cmd/cmd.go:336"}"#;
+        match parse_rclone_line(line) {
+            ParsedRcloneLine::Note { level, msg } => {
+                assert_eq!(level, "notice");
+                assert!(is_quota_exceeded(&msg), "the note must carry the quota reason");
+            }
+            other => panic!("expected a note, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stats_lines_carry_progress_and_the_first_backend_error() {
+        let line = r#"{"time":"2026-10-12T01:14:56.606935564+05:00","level":"info","msg":"\nTransferred:   \t    2.289 MiB / 2.289 MiB, 100%\n","stats":{"bytes":2399924.0,"checks":6,"elapsedTime":630.0,"errors":27,"fatalError":false,"lastError":"googleapi: Error403: The user's Drive storage quota has been exceeded., storageQuotaExceeded","listed":1092,"speed":32928.24,"totalBytes":2399924.0,"totalChecks":6,"totalTransfers":0},"source":"accounting/stats.go:551"}"#;
+        match parse_rclone_line(line) {
+            ParsedRcloneLine::Progress {
+                current,
+                max,
+                last_error,
+            } => {
+                assert_eq!(current, 2_399_924.0);
+                assert_eq!(max, 2_399_924.0);
+                assert!(last_error.is_some_and(|e| is_quota_exceeded(&e)));
+            }
+            other => panic!("expected progress, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn copied_and_skipped_lines_still_report_changes() {
+        let copied = r#"{"time":"2026-10-12T01:14:50.0+05:00","level":"info","msg":"Copied (new)","object":"Baldur's Gate 3/mapping.yaml","objectType":"*drive.Object","source":"operations/operations.go:2591"}"#;
+        match parse_rclone_line(copied) {
+            ParsedRcloneLine::Change { msg, .. } => assert_eq!(msg, "Copied (new)"),
+            other => panic!("expected a change, got {other:?}"),
+        }
+
+        let skipped = r#"{"time":"2026-10-12T01:14:50.0+05:00","level":"info","msg":"Skipped copy as already exists","object":"Ultrakill/mapping.yaml","objectType":"*drive.Object","skipped":"copy","source":"operations/operations.go:2591"}"#;
+        match parse_rclone_line(skipped) {
+            ParsedRcloneLine::Skip { skipped, .. } => assert_eq!(skipped, "copy"),
+            other => panic!("expected a skip, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plain_text_lines_are_ignored_rather_than_misread() {
+        // rclone only emits JSON when `--use-json-log` is set; anything else must not
+        // be mistaken for a diagnostic.
+        assert!(matches!(parse_rclone_line("Transferred: 1 / 1, 100%"), ParsedRcloneLine::Ignored));
+        assert!(matches!(parse_rclone_line(""), ParsedRcloneLine::Ignored));
     }
 }

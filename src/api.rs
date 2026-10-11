@@ -105,6 +105,15 @@ impl Ludusavi {
                     crate::cloud::RcloneProcessEvent::Change(change) => {
                         changes.push(change);
                     }
+                    crate::cloud::RcloneProcessEvent::Notice { msg, .. }
+                        if crate::cloud::is_quota_exceeded(&msg) =>
+                    {
+                        log::error!("aborting cloud sync: storage quota exceeded ({msg})");
+                        let _ = process.kill();
+                        let _ = process.reap();
+                        return Err(Error::CloudStorageQuotaExceeded);
+                    }
+                    crate::cloud::RcloneProcessEvent::Notice { .. } => {}
                 }
             }
             match process.succeeded() {
