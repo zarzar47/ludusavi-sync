@@ -880,11 +880,11 @@ impl Ludusavi {
         }
     }
 
-    /// Configure Google Drive as the cloud remote.
+    /// Configure an OAuth cloud remote (Google Drive, Dropbox, or OneDrive).
     ///
-    /// This runs `rclone config create`, which for Google Drive drives rclone's own OAuth
-    /// flow (it opens a browser and waits for the user to approve access). That's a
-    /// blocking, possibly slow, network+UI operation - call this from a background
+    /// This runs `rclone config create`, which for these providers drives rclone's own
+    /// OAuth flow (it opens a browser and waits for the user to approve access). That's
+    /// a blocking, possibly slow, network+UI operation - call this from a background
     /// thread, not directly on a UI event loop.
     ///
     /// `on_auth_url` is called as soon as rclone prints the browser link, before this
@@ -892,36 +892,33 @@ impl Ludusavi {
     /// (e.g. a broken/missing default-browser association just silently does nothing,
     /// confirmed live on this project's own dev Steam Deck), so the caller should always
     /// show this link so the user can open/paste it manually as a fallback.
-    pub fn set_cloud_remote_google_drive(&mut self, on_auth_url: impl FnMut(&str)) -> Result<(), Error> {
-        self.configure_cloud_reporting_url(
-            Remote::GoogleDrive {
-                id: Remote::generate_id(),
-            },
-            on_auth_url,
-        )
+    pub fn set_cloud_remote(
+        &mut self,
+        provider: crate::cloud::CloudProvider,
+        on_auth_url: impl FnMut(&str),
+    ) -> Result<(), Error> {
+        self.configure_cloud_reporting_url(provider.to_remote(), on_auth_url)
     }
 
-    /// Split version of `set_cloud_remote_google_drive`, for a caller that can't hold
-    /// `&mut self` for rclone's OAuth wait - namely the Tauri backend, where `Ludusavi`
-    /// sits behind one shared mutex that every command locks. Holding it across the
-    /// wait (which blocks on browser approval and can take minutes, or hang forever if
-    /// abandoned) would stall every other command - Scan included - until it resolves.
+    /// Split version of `set_cloud_remote`, for a caller that can't hold `&mut self` for
+    /// rclone's OAuth wait - namely the Tauri backend, where `Ludusavi` sits behind one
+    /// shared mutex that every command locks. Holding it across the wait (which blocks
+    /// on browser approval and can take minutes, or hang forever if abandoned) would
+    /// stall every other command - Scan included - until it resolves.
     ///
     /// Tears down whatever remote is currently configured, then returns an `Rclone`
     /// primed for the new one and the `Remote` to pass to `commit_cloud_remote` once
     /// the caller has run `Rclone::configure_remote_reporting_url` on it (with the
     /// state lock released) and it succeeded.
-    pub fn begin_cloud_remote_google_drive(&self) -> (Rclone, Remote) {
+    pub fn begin_cloud_remote(&self, provider: crate::cloud::CloudProvider) -> (Rclone, Remote) {
         if let Some(old_remote) = self.config.cloud.remote.as_ref() {
             let _ = Rclone::new(self.config.apps.rclone.clone(), old_remote.clone()).unconfigure_remote();
         }
-        let remote = Remote::GoogleDrive {
-            id: Remote::generate_id(),
-        };
+        let remote = provider.to_remote();
         (Rclone::new(self.config.apps.rclone.clone(), remote.clone()), remote)
     }
 
-    /// Persists a remote configured via `begin_cloud_remote_google_drive`'s `Rclone` -
+    /// Persists a remote configured via `begin_cloud_remote`'s `Rclone` -
     /// call only once that succeeded.
     pub fn commit_cloud_remote(&mut self, remote: Remote) {
         self.config.cloud.remote = Some(remote);

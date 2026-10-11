@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 
 use ludusavi::{
     api::{CloudStatus, Ludusavi, parameters},
+    cloud::CloudProvider,
     lang::TRANSLATOR,
     path::StrictPath,
     prelude::{Cancel, Error, Finality},
@@ -912,8 +913,8 @@ async fn cloud_status(state: tauri::State<'_, AppState>) -> Result<CloudStatus, 
 ///
 /// Deliberately only locks `AppState`'s shared `Ludusavi` mutex twice, briefly, around
 /// the OAuth wait rather than for its whole duration (via
-/// `begin_cloud_remote_google_drive`/`commit_cloud_remote` instead of the one-shot
-/// `set_cloud_remote_google_drive`) - every other command (Scan included) locks that
+/// `begin_cloud_remote`/`commit_cloud_remote` instead of the one-shot
+/// `set_cloud_remote`) - every other command (Scan included) locks that
 /// same mutex, so holding it for the wait would stall all of them until the user
 /// finishes approving in the browser, confirmed live as the cause of Scan silently
 /// hanging on this project's own dev Steam Deck after a Google Drive connect was left
@@ -925,10 +926,10 @@ async fn cloud_status(state: tauri::State<'_, AppState>) -> Result<CloudStatus, 
 /// this project's own dev Steam Deck), so the frontend should always display this link
 /// for the user to open/paste manually rather than assume a browser popped up.
 #[tauri::command]
-async fn connect_google_drive(app: tauri::AppHandle) -> Result<(), String> {
+async fn connect_cloud(app: tauri::AppHandle, provider: CloudProvider) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        let (rclone, remote) = with_ludusavi(&state, |l| Ok(l.begin_cloud_remote_google_drive()))?;
+        let (rclone, remote) = with_ludusavi(&state, |l| Ok(l.begin_cloud_remote(provider)))?;
 
         let event_app = app.clone();
         rclone
@@ -1143,7 +1144,7 @@ pub fn run() {
             scan_games,
             cancel_scan,
             cloud_status,
-            connect_google_drive,
+            connect_cloud,
             disconnect_cloud,
             set_cloud_path,
             set_cloud_synchronize,

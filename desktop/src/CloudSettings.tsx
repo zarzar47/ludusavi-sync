@@ -13,12 +13,33 @@ interface CloudStatus {
   rclone_valid: boolean;
 }
 
+// Mirrors cloud::CloudProvider (serde camelCase) - the OAuth providers the
+// `connect_cloud` command accepts. Only one remote is ever active: connecting
+// tears down whatever was configured before.
+type CloudProviderId = "googleDrive" | "dropbox" | "oneDrive";
+
+const CLOUD_PROVIDERS: { id: CloudProviderId; label: string }[] = [
+  { id: "googleDrive", label: "Google Drive" },
+  { id: "dropbox", label: "Dropbox" },
+  { id: "oneDrive", label: "OneDrive" },
+];
+
+// `CloudStatus.remote_kind` is rclone's backend slug ("drive", "dropbox", ...);
+// show the human name instead.
+const REMOTE_LABELS: Record<string, string> = {
+  drive: "Google Drive",
+  dropbox: "Dropbox",
+  onedrive: "OneDrive",
+};
+
 export function CloudSettings() {
   const [status, setStatus] = useState<CloudStatus | null>(null);
   const [pathDraft, setPathDraft] = useState("");
   const [busy, setBusy] = useState(false);
+  // Which provider a connect is in flight for, for the button's busy label.
+  const [connecting, setConnecting] = useState<CloudProviderId | null>(null);
   const [error, setError] = useState<string | null>(null);
-  // The Google OAuth link, shown so the user can open/paste it manually - rclone's own
+  // The OAuth link, shown so the user can open/paste it manually - rclone's own
   // browser auto-open isn't reliable (e.g. a broken/missing default-browser association
   // just silently does nothing), so this is the primary path, not just a fallback.
   const [authUrl, setAuthUrl] = useState<string | null>(null);
@@ -45,20 +66,22 @@ export function CloudSettings() {
     };
   }, []);
 
-  async function connect() {
+  async function connect(provider: CloudProviderId) {
     setBusy(true);
+    setConnecting(provider);
     setError(null);
     setAuthUrl(null);
     try {
       // Emits "cloud-auth-url" (caught above) as soon as rclone prints the link,
       // well before this resolves - it doesn't return until the user finishes (or
       // abandons) approval in the browser, so it can take a while.
-      await invoke("connect_google_drive");
+      await invoke("connect_cloud", { provider });
       refresh();
     } catch (e) {
       setError(String(e));
     } finally {
       setBusy(false);
+      setConnecting(null);
       setAuthUrl(null);
     }
   }
@@ -154,7 +177,7 @@ export function CloudSettings() {
       {status.connected ? (
         <>
           <p>
-            Connected: <strong>{status.remote_kind}</strong>
+            Connected: <strong>{REMOTE_LABELS[status.remote_kind ?? ""] ?? status.remote_kind}</strong>
           </p>
           <label className="field">
             Cloud folder
@@ -185,9 +208,13 @@ export function CloudSettings() {
       ) : (
         <>
           <p>No cloud remote configured.</p>
-          <button disabled={busy || !status.rclone_valid} onClick={connect}>
-            {busy ? "Waiting for Google sign-in..." : "Connect Google Drive"}
-          </button>
+          <div className="row">
+            {CLOUD_PROVIDERS.map(({ id, label }) => (
+              <button key={id} disabled={busy || !status.rclone_valid} onClick={() => connect(id)}>
+                {connecting === id ? `Waiting for ${label} sign-in...` : `Connect ${label}`}
+              </button>
+            ))}
+          </div>
           {authUrl && (
             <div className="auth-url-box">
               <p>

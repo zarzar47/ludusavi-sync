@@ -399,6 +399,41 @@ impl ToString for RemoteChoice {
     }
 }
 
+/// The OAuth-backed cloud providers a UI can offer, as a thin pick-list over
+/// [`Remote`]. rclone drives the browser login for each the same way
+/// (`Rclone::configure_remote_reporting_url`), so the only difference between them
+/// here is which [`Remote`] variant gets built - the id is generated at connect time
+/// either way. Only one remote is ever active: `config.cloud.remote` is a single slot
+/// and every configure path tears the previous one down first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CloudProvider {
+    GoogleDrive,
+    Dropbox,
+    OneDrive,
+}
+
+impl CloudProvider {
+    pub const ALL: &'static [Self] = &[Self::GoogleDrive, Self::Dropbox, Self::OneDrive];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::GoogleDrive => "Google Drive",
+            Self::Dropbox => "Dropbox",
+            Self::OneDrive => "OneDrive",
+        }
+    }
+
+    pub fn to_remote(&self) -> Remote {
+        let id = Remote::generate_id();
+        match self {
+            Self::GoogleDrive => Remote::GoogleDrive { id },
+            Self::Dropbox => Remote::Dropbox { id },
+            Self::OneDrive => Remote::OneDrive { id },
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename = "camelCase")] // Legacy: Should have been `rename_all`
 pub enum Remote {
@@ -1017,7 +1052,34 @@ impl Rclone {
 
 #[cfg(test)]
 mod tests {
-    use super::{ParsedRcloneLine, escape_rclone_glob, is_quota_exceeded, parse_rclone_line};
+    use super::{CloudProvider, ParsedRcloneLine, Remote, escape_rclone_glob, is_quota_exceeded, parse_rclone_line};
+
+    #[test]
+    fn cloud_provider_serde_names_match_what_the_frontend_sends() {
+        // CloudSettings.tsx hardcodes these camelCase ids for the `connect_cloud`
+        // command's argument; a rename here would silently break the buttons.
+        for (provider, json) in [
+            (CloudProvider::GoogleDrive, r#""googleDrive""#),
+            (CloudProvider::Dropbox, r#""dropbox""#),
+            (CloudProvider::OneDrive, r#""oneDrive""#),
+        ] {
+            assert_eq!(serde_json::to_string(&provider).unwrap(), json);
+            assert_eq!(serde_json::from_str::<CloudProvider>(json).unwrap(), provider);
+        }
+    }
+
+    #[test]
+    fn cloud_provider_builds_the_matching_remote_with_a_fresh_id() {
+        for provider in CloudProvider::ALL {
+            assert!(provider.to_remote().id().starts_with("ludusavi-"));
+        }
+        assert!(matches!(
+            CloudProvider::GoogleDrive.to_remote(),
+            Remote::GoogleDrive { .. }
+        ));
+        assert!(matches!(CloudProvider::Dropbox.to_remote(), Remote::Dropbox { .. }));
+        assert!(matches!(CloudProvider::OneDrive.to_remote(), Remote::OneDrive { .. }));
+    }
 
     #[test]
     fn escapes_glob_metacharacters_in_folder_names() {
