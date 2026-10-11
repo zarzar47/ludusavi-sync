@@ -87,6 +87,9 @@ fn wait_for_rclone(
             // Best-effort: the child may have exited on its own between the check and
             // the kill, which isn't a failure worth reporting.
             let _ = process.kill();
+            // Reap it, so a cancelled transfer doesn't leave a zombie behind until the
+            // task's `Child` is dropped.
+            let _ = process.reap();
             return Err(Error::Cancelled);
         }
 
@@ -112,16 +115,21 @@ fn wait_for_rclone(
     }
 }
 
-/// Upload settings.config to the cloud after a push.
+/// Upload the merged local state file to the cloud.
+///
+/// Failure here is logged but not fatal: the game files are already uploaded, and
+/// `settings.config` is only used to record per-device sync metadata, so losing it
+/// costs a rescan rather than the backup. A *cancel* is different - it means the user
+/// asked to stop, so it's returned rather than swallowed.
 fn upload_sync_state(
     rclone: &Rclone,
     backup_dir: &StrictPath,
     cloud_path: &str,
     finality: Finality,
     cancel: Option<&Cancel>,
-) {
+) -> Result<(), Error> {
     if finality.preview() {
-        return;
+        return Ok(());
     }
     let mut process = match rclone.copy(
         backup_dir,
@@ -133,14 +141,17 @@ fn upload_sync_state(
         Ok(p) => p,
         Err(e) => {
             log::error!("Failed to start upload of settings.config: {:?}", e);
-            return;
+            return Ok(());
         }
     };
-    if let Err(e) = wait_for_rclone(&mut process, None, cancel) {
+    match wait_for_rclone(&mut process, None, cancel) {
+        Ok(_) => Ok(()),
         // Cancelling the transfer is legitimate here; anything else is worth logging,
         // but never worth failing the push over - the game files are already up.
-        if e != Error::Cancelled {
+        Err(Error::Cancelled) => Err(Error::Cancelled),
+        Err(e) => {
             log::error!("Failed to upload settings.config: {:?}", e);
+            Ok(())
         }
     }
 }
@@ -179,22 +190,28 @@ fn fetch_cloud_sync_state(
                 finality,
                 &[SyncStateFile::FILE_NAME.to_string()],
             )
-            .map_err(|e| format!("failed to start download: {e:?}"))?;
-        wait_for_rclone(&mut process, None, cancel).map_err(|e| format!("download failed: {e:?}"))?;
+            .map_err(Error::UnableToSynchronizeCloud)?;
+        wait_for_rclone(&mut process, None, cancel)?;
 
         if !staging.joined(SyncStateFile::FILE_NAME).is_file() {
             // Cloud has no state file yet; nothing to merge.
             return Ok(None);
         }
-        Ok::<_, String>(Some(SyncStateFile::load_from(&staging)))
+        Ok::<_, Error>(Some(SyncStateFile::load_from(&staging)))
     })();
 
     let _ = staging.remove();
 
     match result {
         Ok(state) => state,
+        // A cancel here is the user's own doing, so it isn't an error in the log; the
+        // caller still returns `Cancelled` from its own rclone step.
+        Err(Error::Cancelled) => {
+            log::info!("Fetch of cloud {} cancelled", SyncStateFile::FILE_NAME);
+            None
+        }
         Err(e) => {
-            log::error!("Unable to fetch cloud {}: {}", SyncStateFile::FILE_NAME, e);
+            log::error!("Unable to fetch cloud {}: {:?}", SyncStateFile::FILE_NAME, e);
             None
         }
     }
@@ -305,7 +322,7 @@ pub fn push_game(
         if let Err(e) = sync_state.save_to(backup_dir) {
             log::error!("Failed to save sync state locally: {:?}", e);
         }
-        upload_sync_state(&rclone, backup_dir, cloud_path, finality, cancel);
+        upload_sync_state(&rclone, backup_dir, cloud_path, finality, cancel)?;
     }
 
     Ok(SyncResult {

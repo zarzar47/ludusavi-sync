@@ -222,6 +222,11 @@ impl RcloneProcess {
         }
         res
     }
+
+    /// Block until the child has exited, releasing it as a zombie. Used after [`Self::kill`].
+    pub fn reap(&mut self) -> Result<(), std::io::Error> {
+        self.child.wait().map(|_| ())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

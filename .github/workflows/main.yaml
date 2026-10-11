@@ -49,3 +49,26 @@ jobs:
         with:
           name: ludusavi-v${{ env.LUDUSAVI_VERSION }}-${{ matrix.artifact-name }}
           path: target/release/${{ matrix.artifact-file }}
+
+  desktop-tests:
+    # The Tauri backend's own tests (`cargo test` in desktop/src-tauri) need
+    # libwebkit2gtk-4.1-dev to link, which is the same heavyweight pin dance
+    # desktop-build.yaml does - that runs on tags only, so it stays there.
+    # The frontend half is plain TypeScript and needs nothing but Node.
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          # 24, not 22: `pnpm test` runs TypeScript directly via Node's type stripping,
+          # which is only on by default from 22.18/23.6.
+          node-version: '24'
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test
+      - run: npx tsc --noEmit -p tsconfig.json

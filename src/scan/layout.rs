@@ -29,10 +29,15 @@ const SOLO: &str = ".";
 /// Mark the files a cancelled backup never reached as failed.
 ///
 /// Going through `BackupInfo::failed_files` (rather than just breaking out of the copy
-/// loop) is what keeps the recorded backup honest: `Backup::prune_failures` drops these
-/// from the new backup's mapping, and `Backup::needed` then declines to record it at all
-/// if nothing was copied - so a cancel mid-backup leaves the previous backups untouched
-/// instead of a half-populated one that claims to be complete.
+/// loop) is what keeps a `SOLO` backup from being recorded as complete when it isn't:
+/// `Backup::prune_failures` drops these from the new backup's mapping, and `Backup::needed`
+/// then declines to record it at all if nothing was copied.
+///
+/// Note that this is deliberately *not* treated as "the unreached files are gone". When a
+/// cancelled run reused a backup directory in place (see `SOLO`), those files are still on
+/// disk exactly as they were, so both the prune and the irrelevant-file cleanup are skipped
+/// for it - see `execute_backup_as_simple` and `run_backup`. A cancel must never delete a
+/// previously valid backup.
 fn mark_remaining_cancelled(
     backup_info: &mut BackupInfo,
     backup: &Backup,
@@ -1305,7 +1310,7 @@ impl GameLayout {
             }
         }
 
-        if backup.full() && backup.name() == SOLO {
+        if backup.full() && backup.name() == SOLO && !backup_info.cancelled() {
             self.remove_irrelevant_backup_files(backup.name(), &relevant_files);
             self.remove_empty_backup_subdirs(backup.name());
         }
@@ -1661,13 +1666,14 @@ impl GameLayout {
         Some(())
     }
 
-    /// Create a backup for `scan`, copying any changed files.
-    ///
-    /// `cancel` is checked between files. Cancelling marks the files it hadn't reached
-    /// yet as failed rather than skipping them, so `prune_failures` drops them from the
-    /// new backup's mapping and the previously-recorded backups stay authoritative -
-    /// i.e. a cancelled backup leaves the same state as a partial one that failed for
-    /// any other reason.
+/// Create a backup for `scan`, copying any changed files.
+///
+/// `cancel` is checked between files. Cancelling marks the files it hadn't reached yet as
+/// failed, so that a fresh backup records only what it actually wrote. For a backup that
+/// was written into a fresh directory, that leaves the same state as a partial one that
+/// failed for any other reason; for a `SOLO` backup, which is written in place over the
+/// previous one, those unreached files are left on disk and kept in the mapping instead,
+/// since a cancel must not destroy what was already backed up.
     pub fn back_up(
         &mut self,
         scan: &ScanInfo,
@@ -1711,7 +1717,16 @@ impl GameLayout {
                     backup.name()
                 );
                 let backup_info = self.execute_backup(&backup, scan, format, cancel);
-                backup.prune_failures(&backup_info);
+                // A `SOLO` backup is written *in place* over the previous one, so its
+                // directory already holds files this run may never have reached. Pruning
+                // on a cancelled run would therefore drop entries that are still sitting
+                // there on disk, leaving the saved mapping pointing at files that no
+                // longer exist. The entries that were copied or already matched are still
+                // accurate; the ones we never got to are still valid from last time.
+                let reused_in_place = backup.full() && backup.name() == SOLO;
+                if !(reused_in_place && backup_info.cancelled()) {
+                    backup.prune_failures(&backup_info);
+                }
                 if backup.needed() {
                     self.insert_backup(backup.clone());
                     self.forget_excess_backups(retention);
@@ -4382,6 +4397,110 @@ children: []
             let full = FullBackup::default();
             let yaml = serde_yaml::to_string(&full).unwrap();
             assert!(!yaml.contains("semantics"), "default semantics should be skipped");
+        }
+    }
+
+    /// A cancel is the one backup failure that doesn't invalidate what came before it, so
+    /// it has to be distinguishable from a real per-file failure. `run_backup` and
+    /// `execute_backup_as_simple` both skip their destructive in-place cleanup when this
+    /// is true - otherwise cancelling a `SOLO` backup deletes the files it never reached,
+    /// which are still perfectly valid from the previous run.
+    mod cancelled_backup {
+        use pretty_assertions::assert_eq;
+
+        use super::*;
+        use crate::testing::{make_original_path, mapping_file_key};
+
+        fn scanned_file() -> ScannedFile {
+            ScannedFile {
+                size: 1,
+                hash: "3a52ce780950d4d969792a2559cd519d7ee8c727".into(),
+                original_path: Some(make_original_path("/file1.txt")),
+                ignored: false,
+                change: ScanChange::New,
+                container: None,
+                redirected: None,
+            }
+        }
+
+        #[test]
+        fn a_cancel_is_not_confused_with_an_ordinary_failure() {
+            let mut info = BackupInfo::default();
+            info.failed_files
+                .insert(make_original_path("/file1.txt"), BackupError::App(Error::Cancelled));
+            assert!(info.cancelled());
+
+            let mut info = BackupInfo::default();
+            info.failed_files.insert(
+                make_original_path("/file1.txt"),
+                BackupError::Raw("disk full".into()),
+            );
+            assert!(!info.cancelled(), "a real failure isn't a cancel");
+
+            assert!(!BackupInfo::default().cancelled(), "a clean run isn't a cancel");
+        }
+
+        #[test]
+        fn cancelling_marks_the_unreached_files_as_failed() {
+            let file = scanned_file();
+            let key = make_original_path("/file1.txt");
+            let backup = Backup::Full(FullBackup {
+                name: SOLO.to_string(),
+                files: btree_map! {
+                    mapping_file_key("/file1.txt"): IndividualMappingFile {
+                        hash: file.hash.clone(),
+                        size: 1,
+                    },
+                },
+                ..Default::default()
+            });
+
+            let mut info = BackupInfo::default();
+            mark_remaining_cancelled(&mut info, &backup, &[(&key, &file)]);
+
+            assert!(info.cancelled());
+            assert_eq!(info.failed_files.len(), 1);
+        }
+
+        #[test]
+        fn cancelling_skips_files_the_backup_was_not_going_to_copy() {
+            // An excluded file is never copied, so a cancel shouldn't report it as failed:
+            // that would make `cancelled()` fire for runs that had nothing to lose.
+            let file = scanned_file();
+            let key = make_original_path("/file1.txt");
+            let backup = Backup::Full(FullBackup {
+                name: SOLO.to_string(),
+                files: BTreeMap::new(),
+                ..Default::default()
+            });
+
+            let mut info = BackupInfo::default();
+            mark_remaining_cancelled(&mut info, &backup, &[(&key, &file)]);
+
+            assert!(!info.cancelled());
+            assert!(info.successful());
+        }
+
+        #[test]
+        fn a_solo_backup_is_written_in_place_over_the_previous_one() {
+            // This is what makes a cancel destructive if the cleanup isn't skipped: the
+            // new run shares a directory with the old one, so "irrelevant" is computed
+            // against a file list the cancelled run only partially filled in.
+            let layout = GameLayout::default();
+            let name = layout.generate_backup_name(
+                &BackupKind::Full,
+                &chrono::NaiveDate::from_ymd_opt(2000, 1, 2)
+                    .unwrap()
+                    .and_hms_opt(3, 4, 5)
+                    .unwrap()
+                    .and_utc(),
+                &BackupFormats {
+                    chosen: BackupFormat::Simple,
+                    ..Default::default()
+                },
+                Retention::new(1, 0),
+            );
+            assert_eq!(SOLO, name);
         }
     }
 }

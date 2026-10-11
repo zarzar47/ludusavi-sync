@@ -36,6 +36,18 @@ impl BackupInfo {
         self.failed_files.is_empty() && self.failed_registry.is_empty()
     }
 
+    /// Whether this run stopped early because the user cancelled it, as opposed to
+    /// individual files failing.
+    ///
+    /// This matters because a cancelled run is the one failure that says nothing about
+    /// whether a backup is usable on disk: the files it never reached are still exactly
+    /// as valid as they were before it started.
+    pub fn cancelled(&self) -> bool {
+        self.failed_files
+            .values()
+            .any(|e| matches!(e, BackupError::App(crate::prelude::Error::Cancelled)))
+    }
+
     pub fn total_failure(scan: &ScanInfo, error: BackupError) -> Self {
         let mut backup_info = Self::default();
 
