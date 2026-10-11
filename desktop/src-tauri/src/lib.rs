@@ -18,7 +18,7 @@ use ludusavi::{
     lang::TRANSLATOR,
     path::StrictPath,
     prelude::{Cancel, Error, Finality},
-    report::{ApiGame, ApiOutput, SaveError},
+    report::{ApiFile, ApiGame, ApiOutput, SaveError},
     resource::{SaveableResourceFile, sync_state::GameSyncEntry},
     scan::{change::ScanChange, OperationStepDecision, registry::RegistryItem},
     sync::{SyncHooks, SyncPhase, SyncProgress},
@@ -663,6 +663,15 @@ struct ScanEntry {
     /// `backup.toggledPaths`/`toggledRegistry`) - the checkbox's unchecked state.
     ignored: bool,
     kind: &'static str,
+    /// Whether the file is present at `path` right now. False means the entry is a ghost
+    /// reconstructed from the last backup's `mapping.yaml` - backed up once, since
+    /// deleted from disk. `ScanChange` can't tell those apart reliably (an ignored live
+    /// file also normalizes to `Removed`), so the disk itself is asked. Registry entries
+    /// are always `true`: there's no portable existence check for them, and the file
+    /// filter is the whole reason this flag exists.
+    exists: bool,
+    /// Debug-formatted `ScanChange` (e.g. "New", "Different", "Removed").
+    change: String,
 }
 
 /// Save files (and, on Windows, registry entries) found for a single game - a
@@ -682,14 +691,18 @@ async fn game_scan_entries(game: String, state: tauri::State<'_, AppState>) -> R
         let mut entries = Vec::new();
         if let Some(ApiGame::Operative { files, registry, .. }) = output.games.get(&game) {
             entries.extend(files.iter().map(|(path, file)| ScanEntry {
+                exists: StrictPath::new(path).exists(),
                 path: path.clone(),
                 ignored: file.ignored,
                 kind: "file",
+                change: format!("{:?}", file.change),
             }));
             entries.extend(registry.iter().map(|(path, entry)| ScanEntry {
                 path: path.clone(),
                 ignored: entry.ignored,
                 kind: "registry",
+                exists: true,
+                change: format!("{:?}", entry.change),
             }));
         }
         entries.sort_by(|a, b| a.path.cmp(&b.path));
@@ -812,6 +825,16 @@ struct ScanResult {
     change: String,
 }
 
+/// How many of a scanned game's files are present at their save location right now.
+///
+/// The preview scan's file map also holds "removed" ghosts - paths recorded in the last
+/// backup's `mapping.yaml` that no longer exist on disk - so `files.len()` overstates
+/// what's actually stored on this machine. `ScanChange` can't separate them either
+/// (an ignored live file normalizes to `Removed` as well), so the disk is asked directly.
+fn live_file_count(files: &BTreeMap<String, ApiFile>) -> usize {
+    files.keys().filter(|path| StrictPath::new(*path).exists()).count()
+}
+
 /// Scan every game Ludusavi knows about against this machine's configured roots - the
 /// same full-library preview upstream ludusavi does on startup. Slow-ish (walks
 /// thousands of possible games), which is inherent to the operation, not this UI.
@@ -848,7 +871,7 @@ async fn scan_games(state: tauri::State<'_, AppState>) -> Result<Vec<ScanResult>
                 ..
             } => Some(ScanResult {
                 name,
-                file_count: files.len(),
+                file_count: live_file_count(&files),
                 registry_count: registry.len(),
                 change: format!("{change:?}"),
             }),
@@ -956,48 +979,6 @@ async fn set_rclone_path(path: String, state: tauri::State<'_, AppState>) -> Res
         l.set_rclone_path(path);
         Ok(())
     })
-}
-
-/// Open the containing folder for `path` in the system's file manager.
-/// On Windows this tries `explorer /select,`, on macOS `open -R`, on Linux `xdg-open`.
-#[tauri::command]
-async fn open_in_file_manager(path: String) -> Result<(), String> {
-    use std::path::PathBuf;
-
-    let pb = PathBuf::from(path);
-    let parent = pb.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
-
-    let res = tauri::async_runtime::spawn_blocking(move || {
-        #[cfg(target_os = "windows")]
-        {
-            // explorer supports `/select,` to highlight a file
-            let arg = format!("/select,{}", pb.to_string_lossy());
-            std::process::Command::new("explorer").arg(arg).spawn().map_err(|e| e.to_string())?;
-            Ok(())
-        }
-        #[cfg(target_os = "macos")]
-        {
-            // `open -R` reveals the file in Finder
-            std::process::Command::new("open").arg("-R").arg(pb).spawn().map_err(|e| e.to_string())?;
-            Ok(())
-        }
-        #[cfg(target_os = "linux")]
-        {
-            // Open the parent directory; defaults like xdg-open will use the user's
-            // preferred file manager (Dolphin, Nautilus, etc.). Selecting a file is
-            // not portable across all managers.
-            std::process::Command::new("xdg-open").arg(parent).spawn().map_err(|e| e.to_string())?;
-            Ok(())
-        }
-        #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-        {
-            Err("Unsupported platform".to_string())
-        }
-    })
-    .await
-    .map_err(|e| e.to_string())?;
-
-    res
 }
 
 /// One line of the core's own logging, forwarded to the webview's task log.
@@ -1166,8 +1147,7 @@ pub fn run() {
             disconnect_cloud,
             set_cloud_path,
             set_cloud_synchronize,
-            set_rclone_path
-            , open_in_file_manager
+            set_rclone_path,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
@@ -1636,5 +1616,25 @@ mod tests {
         let outcome = summarize_output("Hades", &output);
         assert!(outcome.errors.is_empty());
         assert!(!contains(&outcome.warnings, "No save data was found"));
+    }
+
+    #[test]
+    fn live_file_count_counts_only_files_present_on_disk() {
+        // The scan's file map mixes files found on disk with "removed" ghosts from the
+        // last backup's mapping.yaml; the card's count must reflect only the former.
+        let dir = std::env::temp_dir();
+        let present = dir.join(format!("ludusavi-present-{}.sav", std::process::id()));
+        let missing = dir.join(format!("ludusavi-missing-{}.sav", std::process::id()));
+        let _ = std::fs::remove_file(&missing);
+        std::fs::write(&present, b"x").unwrap();
+
+        let files = BTreeMap::from([
+            (present.to_string_lossy().into_owned(), ApiFile::default()),
+            (missing.to_string_lossy().into_owned(), ApiFile::default()),
+        ]);
+        let count = live_file_count(&files);
+
+        let _ = std::fs::remove_file(&present);
+        assert_eq!(count, 1, "the ghost path must not count; the real file must");
     }
 }

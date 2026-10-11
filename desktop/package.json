@@ -9,7 +9,7 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "tauri:dev": "bash scripts/dev.sh",
-    "test": "node --test test/tasks.test.ts"
+    "test": "node --test test/tasks.test.ts test/entries.test.ts"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",

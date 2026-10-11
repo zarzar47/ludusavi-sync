@@ -1,7 +1,9 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
+import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import type { GameSyncEntry } from "./App";
+import { missingCount, visibleEntries, type ScanEntry } from "./entries";
 import {
   PHASE_LABELS,
   TASK_LABELS,
@@ -10,13 +12,6 @@ import {
   type RunningTask,
   type TaskLogLine,
 } from "./tasks";
-
-// Mirrors src-tauri's ScanEntry.
-interface ScanEntry {
-  path: string;
-  ignored: boolean;
-  kind: "file" | "registry";
-}
 
 // Mirrors src-tauri's WinePrefixCheck.
 interface WinePrefixCheck {
@@ -41,6 +36,28 @@ function shortPath(path: string): string {
 function parentDir(path: string): string {
   const parts = path.split(/[\\/]/).filter(Boolean);
   return parts.slice(0, -1).join("/") || "/";
+}
+
+// Clipboard write that also works where `navigator.clipboard` is gated off (it needs a
+// secure context, which some WebKitGTK builds don't grant a bundled origin): fall back
+// to a hidden textarea + the deprecated-but-universally-supported execCommand.
+async function copyText(text: string): Promise<void> {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return;
+    } catch {
+      // fall through to the textarea path
+    }
+  }
+  const area = document.createElement("textarea");
+  area.value = text;
+  area.style.position = "fixed";
+  area.style.opacity = "0";
+  document.body.appendChild(area);
+  area.select();
+  document.execCommand("copy");
+  area.remove();
 }
 
 // Opened by right-click or long-press on a game card (App.tsx). Shows the game's
@@ -94,7 +111,13 @@ export function GameSettingsModal({
   const [entries, setEntries] = useState<ScanEntry[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [coverBusy, setCoverBusy] = useState(false);
-  // Filter removed: keep file list unfiltered and show all entries
+  // Files recorded in the last backup but no longer on disk stay out of the list by
+  // default: the checklist is about what's actually stored here. The toggle reveals
+  // them, dimmed and badged, so a recoverable deleted save is still reachable.
+  const [showMissing, setShowMissing] = useState(false);
+  // Which path was just copied, so its button can tick briefly instead of giving
+  // otherwise silent feedback.
+  const [copiedPath, setCopiedPath] = useState<string | null>(null);
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const [wineCheck, setWineCheck] = useState<WinePrefixCheck | null>(null);
   const [cancelling, setCancelling] = useState(false);
@@ -226,17 +249,19 @@ export function GameSettingsModal({
     });
   }
 
+  const visible = useMemo(() => visibleEntries(entries ?? [], showMissing), [entries, showMissing]);
+  const missing = useMemo(() => missingCount(entries ?? []), [entries]);
+
   const groups = useMemo(() => {
-    if (!entries) return [];
     const byDir = new Map<string, ScanEntry[]>();
-    for (const entry of entries) {
+    for (const entry of visible) {
       const dir = parentDir(entry.path);
       byDir.set(dir, [...(byDir.get(dir) ?? []), entry]);
     }
     return [...byDir.entries()].sort(([a], [b]) => a.localeCompare(b));
-  }, [entries]);
+  }, [visible]);
 
-  const totalCount = entries?.length ?? 0;
+  const totalCount = visible.length;
   const shownCount = groups.reduce((sum, [, list]) => sum + list.length, 0);
 
   return (
@@ -336,10 +361,20 @@ export function GameSettingsModal({
             Saves found{totalCount > 0 && ` (${shownCount === totalCount ? totalCount : `${shownCount}/${totalCount}`})`}
           </h3>
           {/* "Filter by path" removed per user request */}
+          {missing > 0 && (
+            <button className="show-missing-toggle" onClick={() => setShowMissing((shown) => !shown)}>
+              {showMissing
+                ? `Hide ${missing} only-in-backup`
+                : `${missing} file(s) only in backup — show`}
+            </button>
+          )}
         </div>
 
         {entries === null && <p>Scanning…</p>}
-        {entries !== null && totalCount === 0 && <p>No save files found for this game.</p>}
+        {entries !== null && totalCount === 0 && missing === 0 && <p>No save files found for this game.</p>}
+        {entries !== null && totalCount === 0 && missing > 0 && (
+          <p>No save files on this machine right now - {missing} only in the backup.</p>
+        )}
         {entries !== null && totalCount > 0 && groups.length === 0 && <p>No files found.</p>}
 
         {groups.length > 0 && (
@@ -371,23 +406,47 @@ export function GameSettingsModal({
                   {!isCollapsed && (
                     <ul className="entry-list">
                       {groupEntries.map((entry) => (
-                        <li key={`${entry.kind}:${entry.path}`} className="entry-row">
+                        <li
+                          key={`${entry.kind}:${entry.path}`}
+                          className={`entry-row${entry.exists ? "" : " entry-row-missing"}`}
+                        >
                           <label>
                             <input type="checkbox" checked={!entry.ignored} onChange={() => toggleEntry(entry)} />
                             {entry.kind === "registry" && <span className="entry-kind">registry</span>}
+                            {!entry.exists && <span className="entry-badge">only in backup</span>}
                             <span className="entry-path" title={entry.path}>
                               {entry.path.split(/[\\/]/).filter(Boolean).pop()}
                             </span>
                           </label>
+                          {entry.exists && (
+                            <button
+                              className="entry-action-button"
+                              title="Show in file manager"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                revealItemInDir(entry.path).catch((err) => setError(String(err)));
+                              }}
+                            >
+                              ↗
+                            </button>
+                          )}
                           <button
-                            className="open-entry-button"
-                            title="Open containing folder"
+                            className="entry-action-button"
+                            title="Copy file path"
                             onClick={(e) => {
                               e.stopPropagation();
-                              invoke("open_in_file_manager", { path: entry.path }).catch((err) => setError(String(err)));
+                              copyText(entry.path)
+                                .then(() => {
+                                  setCopiedPath(entry.path);
+                                  window.setTimeout(
+                                    () => setCopiedPath((current) => (current === entry.path ? null : current)),
+                                    1200,
+                                  );
+                                })
+                                .catch((err) => setError(String(err)));
                             }}
                           >
-                            ↗
+                            {copiedPath === entry.path ? "✓" : "⧉"}
                           </button>
                         </li>
                       ))}
